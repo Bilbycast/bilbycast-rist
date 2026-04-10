@@ -5,17 +5,11 @@
 //! - Incoming RTP media from the sender
 //! - Incoming RTCP (SR, RTT echo) from the sender
 //! - Periodic RTCP RR + SDES + NACK emission
-//!
-//! Hot-path design:
-//! - Receives into pre-allocated BytesMut, freezes the payload slice into
-//!   Bytes for delivery (single allocation per packet, reference-counted)
-//! - NackScheduler uses O(1) ring buffer — no BTreeMap on receive path
-//! - `try_send` for non-blocking delivery to application
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -45,7 +39,7 @@ pub fn spawn_receiver(
     rtcp_socket: UdpSocket,
     cancel: CancellationToken,
 ) -> (ReceiverHandle, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel::<Bytes>(256);
+    let (tx, rx) = mpsc::channel::<Bytes>(1024);
 
     let handle = tokio::spawn(async move {
         if let Err(e) = receiver_loop(config, rtp_socket, rtcp_socket, tx, cancel).await {
@@ -73,8 +67,8 @@ async fn receiver_loop(
         NackScheduler::new(config.max_nack_retries, Duration::from_millis(50));
     let mut rtt_estimator = RttEstimator::new(config.rtcp_interval * 10);
 
-    // Pre-allocated receive buffers — reused every iteration
-    let mut rtp_buf = BytesMut::with_capacity(MAX_UDP_RECV);
+    // Pre-allocated receive buffers
+    let mut rtp_buf = vec![0u8; MAX_UDP_RECV];
     let mut rtcp_recv_buf = vec![0u8; MAX_UDP_RECV];
 
     let mut sender_rtcp_addr: Option<SocketAddr> = None;
@@ -83,10 +77,13 @@ async fn receiver_loop(
     // Monotonic time base for arrival timestamps
     let time_base = Instant::now();
 
-    loop {
-        // Reset receive buffer capacity for next recv (no alloc if capacity sufficient)
-        rtp_buf.resize(MAX_UDP_RECV, 0);
+    log::info!(
+        "RIST receiver loop started on RTP={} RTCP={}",
+        rtp_socket.local_addr()?,
+        rtcp_socket.local_addr()?
+    );
 
+    loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 log::info!("RIST receiver shutting down");
@@ -95,90 +92,102 @@ async fn receiver_loop(
 
             // Incoming RTP media
             result = rtp_socket.recv_from(&mut rtp_buf) => {
-                let (len, from) = result?;
-                let now = Instant::now();
-                let arrival_us = now.duration_since(time_base).as_micros() as u64;
+                match result {
+                    Ok((len, from)) => {
+                        let now = Instant::now();
+                        let arrival_us = now.duration_since(time_base).as_micros() as u64;
 
-                // Learn sender RTCP address from first packet
-                if sender_rtcp_addr.is_none() {
-                    sender_rtcp_addr = Some(crate::channel::RistChannel::rtcp_addr_for(from));
-                    log::info!("RIST receiver: sender detected at {from}");
-                }
+                        // Learn sender RTCP address from first packet
+                        if sender_rtcp_addr.is_none() {
+                            sender_rtcp_addr = Some(crate::channel::RistChannel::rtcp_addr_for(from));
+                            log::info!("RIST receiver: sender detected at {from}");
+                        }
 
-                // Parse RTP header (no allocation — reads from buffer in place)
-                if let Ok((header, header_size)) = RtpHeader::parse(&rtp_buf[..len]) {
-                    let seq = header.sequence_number;
-                    let rtp_ts = header.timestamp;
+                        // Parse RTP header
+                        match RtpHeader::parse(&rtp_buf[..len]) {
+                            Ok((header, header_size)) => {
+                                let seq = header.sequence_number;
+                                let rtp_ts = header.timestamp;
 
-                    // Update RTCP receiver state — O(1) per packet
-                    rtcp_state.on_packet_received(seq, rtp_ts, arrival_us);
+                                // Update RTCP receiver state
+                                rtcp_state.on_packet_received(seq, rtp_ts, arrival_us);
 
-                    // Detect gaps for NACK scheduling — O(1) per packet
-                    let _new_gaps = nack_scheduler.on_packet_received(seq, now);
+                                // Detect gaps for NACK scheduling
+                                let _new_gaps = nack_scheduler.on_packet_received(seq, now);
 
-                    // Deliver payload to application.
-                    // Truncate to actual received size, split off header, freeze.
-                    // This creates a Bytes from the BytesMut without copying the
-                    // payload data — it's a refcount bump + pointer arithmetic.
-                    rtp_buf.truncate(len);
-                    let _ = rtp_buf.split_to(header_size); // discard header
-                    let payload = rtp_buf.split().freeze(); // zero-copy freeze
-
-                    if tx.try_send(payload).is_err() {
-                        log::warn!("RIST receiver: application channel full, dropping packet");
+                                // Deliver payload to application
+                                let payload = Bytes::copy_from_slice(&rtp_buf[header_size..len]);
+                                if tx.try_send(payload).is_err() {
+                                    log::warn!("RIST receiver: application channel full, dropping packet");
+                                }
+                            }
+                            Err(e) => {
+                                log::debug!("RTP parse error: {e}, len={len}");
+                            }
+                        }
                     }
-
-                    // Re-grow buffer for next recv (reuses existing allocation
-                    // if BytesMut has capacity left; otherwise allocates fresh)
-                    rtp_buf.reserve(MAX_UDP_RECV);
+                    Err(e) => {
+                        log::warn!("RTP recv error: {e}");
+                    }
                 }
             }
 
             // Incoming RTCP from sender (SR, RTT echo)
             result = rtcp_socket.recv_from(&mut rtcp_recv_buf) => {
-                let (len, from) = result?;
-                let now = Instant::now();
+                match result {
+                    Ok((len, from)) => {
+                        let now = Instant::now();
 
-                if sender_rtcp_addr.is_none() {
-                    sender_rtcp_addr = Some(from);
-                }
-
-                if let Ok(compound) = RtcpCompound::parse(&rtcp_recv_buf[..len]) {
-                    for pkt in &compound.packets {
-                        match pkt {
-                            RtcpPacket::SenderReport(sr) => {
-                                rtcp_state.on_sr_received(sr, now);
-                            }
-                            RtcpPacket::App(RistApp::RttEchoRequest(req)) => {
-                                let response = RistApp::RttEchoResponse(
-                                    rist_protocol::packet::rtcp_app::RttEchoResponse {
-                                        ssrc: req.ssrc,
-                                        timestamp_msw: req.timestamp_msw,
-                                        timestamp_lsw: req.timestamp_lsw,
-                                        processing_delay_us: 0,
-                                    },
-                                );
-                                let compound = RtcpCompound {
-                                    packets: vec![RtcpPacket::App(response)],
-                                };
-                                let bytes = compound.serialize();
-                                let _ = rtcp_socket.send_to(&bytes, from).await;
-                            }
-                            RtcpPacket::App(RistApp::RttEchoResponse(resp)) => {
-                                rtt_estimator.on_response(
-                                    now,
-                                    resp.timestamp_msw,
-                                    resp.timestamp_lsw,
-                                    resp.processing_delay_us,
-                                );
-                            }
-                            _ => {}
+                        if sender_rtcp_addr.is_none() {
+                            sender_rtcp_addr = Some(from);
                         }
+
+                        match RtcpCompound::parse(&rtcp_recv_buf[..len]) {
+                            Ok(compound) => {
+                                for pkt in &compound.packets {
+                                    match pkt {
+                                        RtcpPacket::SenderReport(sr) => {
+                                            rtcp_state.on_sr_received(sr, now);
+                                        }
+                                        RtcpPacket::App(RistApp::RttEchoRequest(req)) => {
+                                            let response = RistApp::RttEchoResponse(
+                                                rist_protocol::packet::rtcp_app::RttEchoResponse {
+                                                    ssrc: req.ssrc,
+                                                    timestamp_msw: req.timestamp_msw,
+                                                    timestamp_lsw: req.timestamp_lsw,
+                                                    processing_delay_us: 0,
+                                                },
+                                            );
+                                            let compound = RtcpCompound {
+                                                packets: vec![RtcpPacket::App(response)],
+                                            };
+                                            let bytes = compound.serialize();
+                                            let _ = rtcp_socket.send_to(&bytes, from).await;
+                                        }
+                                        RtcpPacket::App(RistApp::RttEchoResponse(resp)) => {
+                                            rtt_estimator.on_response(
+                                                now,
+                                                resp.timestamp_msw,
+                                                resp.timestamp_lsw,
+                                                resp.processing_delay_us,
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::debug!("RTCP parse error: {e}, len={len}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("RTCP recv error: {e}");
                     }
                 }
             }
 
-            // Periodic RTCP emission (not hot path — allocations acceptable)
+            // Periodic RTCP emission
             _ = rtcp_interval.tick() => {
                 let now = Instant::now();
 

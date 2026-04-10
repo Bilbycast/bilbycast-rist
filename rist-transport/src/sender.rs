@@ -80,9 +80,6 @@ async fn sender_loop(
     let mut send_buf = BytesMut::with_capacity(MAX_RTP_PACKET);
     let mut rtcp_recv_buf = vec![0u8; 2048];
 
-    // Connect RTP socket to avoid per-packet address resolution
-    rtp_socket.connect(remote_rtp_addr).await?;
-
     let remote_rtcp_addr = crate::channel::RistChannel::rtcp_addr_for(remote_rtp_addr);
     let mut rtcp_interval = tokio::time::interval(config.rtcp_interval);
 
@@ -113,7 +110,7 @@ async fn sender_loop(
                 retransmit_buf.insert(seq, pkt_bytes);
 
                 // Send RTP via connected socket (no address lookup)
-                if let Err(e) = rtp_socket.send(&send_buf).await {
+                if let Err(e) = rtp_socket.send_to(&send_buf, remote_rtp_addr).await {
                     log::warn!("RTP send error: {e}");
                 }
 
@@ -136,7 +133,7 @@ async fn sender_loop(
                                             for lost_seq in nack_entry.lost_seqs() {
                                                 if let Some(pkt_data) = retransmit_buf.get(lost_seq) {
                                                     // Zero-copy: Bytes is refcounted
-                                                    let _ = rtp_socket.send(pkt_data).await;
+                                                    let _ = rtp_socket.send_to(pkt_data, remote_rtp_addr).await;
                                                 }
                                             }
                                         }
@@ -145,7 +142,7 @@ async fn sender_loop(
                                         for nack_entry in v {
                                             for lost_seq in nack_entry.lost_seqs() {
                                                 if let Some(pkt_data) = retransmit_buf.get(lost_seq) {
-                                                    let _ = rtp_socket.send(pkt_data).await;
+                                                    let _ = rtp_socket.send_to(pkt_data, remote_rtp_addr).await;
                                                 }
                                             }
                                         }
