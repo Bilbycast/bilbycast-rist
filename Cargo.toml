@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "rist-protocol",
+    "rist-transport",
+]
+resolver = "2"

@@ -1,0 +1,25 @@
+[package]
+name = "rist-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust RIST (Reliable Internet Stream Transport) protocol implementation"
+license = "Proprietary"
+
+[features]
+default = []
+encryption = ["dep:aes", "dep:ctr"]
+main-profile = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+bytes = "1.11"
+log = "0.4"
+rand = "0.9"
+thiserror = "2.0"
+
+# Optional: PSK encryption
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+
+# Optional: Main Profile (GRE keep-alive JSON)
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
