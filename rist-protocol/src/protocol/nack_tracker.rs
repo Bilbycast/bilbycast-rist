@@ -2,96 +2,132 @@
 //!
 //! Sender side: maintains a ring buffer of recently sent packets for retransmission.
 //! Receiver side: detects gaps in sequence numbers and schedules NACKs.
+//!
+//! Both use O(1) flat ring buffers indexed by `seq % capacity` — no heap
+//! allocation on the hot path.
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-/// Sender-side retransmit buffer.
+// ---------------------------------------------------------------------------
+// Sender-side retransmit buffer
+// ---------------------------------------------------------------------------
+
+/// Slot in the retransmit ring buffer.
+struct RetransmitSlot {
+    /// Sequence number that occupies this slot (used to detect stale entries).
+    seq: u16,
+    /// The full RTP packet (header + payload) stored as a reference-counted buffer.
+    data: Bytes,
+}
+
+/// Sender-side retransmit buffer — O(1) insert and lookup.
 ///
-/// Stores recently sent RTP packets indexed by sequence number for NACK-driven
-/// retransmission. Fixed capacity; oldest packets are evicted when full.
-#[derive(Debug)]
+/// Fixed-size flat array indexed by `seq % capacity`. Each slot stores the
+/// packet data and the sequence number that wrote it. Lookup verifies the
+/// sequence number matches to detect evicted entries.
 pub struct RetransmitBuffer {
-    /// Ring buffer of packets indexed by sequence number.
-    /// Key is the 16-bit RTP sequence number.
-    packets: BTreeMap<u16, Bytes>,
-    /// Maximum number of packets to retain.
+    slots: Vec<Option<RetransmitSlot>>,
     capacity: usize,
 }
 
 impl RetransmitBuffer {
     pub fn new(capacity: usize) -> Self {
-        Self {
-            packets: BTreeMap::new(),
-            capacity,
-        }
+        let capacity = capacity.next_power_of_two();
+        let mut slots = Vec::with_capacity(capacity);
+        slots.resize_with(capacity, || None);
+        Self { slots, capacity }
     }
 
-    /// Store a packet for potential retransmission.
+    /// Store a packet for potential retransmission. O(1).
+    #[inline]
     pub fn insert(&mut self, seq: u16, data: Bytes) {
-        self.packets.insert(seq, data);
-        // Evict oldest entries if over capacity
-        while self.packets.len() > self.capacity {
-            // Remove the entry with the smallest key
-            // (this is approximate for wraparound but sufficient for the ring buffer)
-            if let Some(&oldest) = self.packets.keys().next() {
-                self.packets.remove(&oldest);
-            }
+        let idx = seq as usize & (self.capacity - 1);
+        self.slots[idx] = Some(RetransmitSlot { seq, data });
+    }
+
+    /// Look up a packet by sequence number. O(1).
+    /// Returns `None` if the slot has been overwritten by a newer packet.
+    #[inline]
+    pub fn get(&self, seq: u16) -> Option<&Bytes> {
+        let idx = seq as usize & (self.capacity - 1);
+        match &self.slots[idx] {
+            Some(slot) if slot.seq == seq => Some(&slot.data),
+            _ => None,
         }
     }
 
-    /// Look up a packet by sequence number for retransmission.
-    pub fn get(&self, seq: u16) -> Option<&Bytes> {
-        self.packets.get(&seq)
-    }
-
-    /// Number of packets currently buffered.
-    pub fn len(&self) -> usize {
-        self.packets.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.packets.is_empty()
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 }
 
+impl std::fmt::Debug for RetransmitBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetransmitBuffer")
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Receiver-side NACK scheduler
+// ---------------------------------------------------------------------------
+
 /// State of a pending NACK for a single lost sequence number.
-#[derive(Debug, Clone)]
-struct NackEntry {
-    /// When this gap was first detected.
-    #[allow(dead_code)]
-    detected_at: Instant,
+#[derive(Clone, Copy)]
+struct NackSlot {
+    /// The sequence number this slot tracks. Used to detect stale entries.
+    seq: u16,
+    /// Whether this slot is active (has a pending NACK).
+    active: bool,
     /// When the next NACK should be sent.
     next_nack_at: Instant,
     /// Number of NACKs sent for this entry.
     nack_count: u32,
 }
 
-/// Receiver-side NACK scheduler.
+/// Receiver-side NACK scheduler — O(1) gap detection and NACK tracking.
 ///
-/// Detects gaps in received sequence numbers and generates NACK requests
-/// with configurable timing and retry limits.
-#[derive(Debug)]
+/// Uses a flat ring buffer indexed by `seq % capacity`. Gap detection and
+/// recovery marking are both O(1) per packet.
+///
+/// `get_pending_nacks()` scans the active window, which is bounded by the
+/// number of outstanding gaps (typically small, < 100 even under heavy loss).
 pub struct NackScheduler {
-    /// Pending NACKs indexed by missing sequence number.
-    pending: BTreeMap<u16, NackEntry>,
+    slots: Vec<NackSlot>,
+    capacity: usize,
     /// Maximum number of NACK retries per lost packet.
     max_retries: u32,
     /// Base delay before first NACK (overridden by RTT if available).
     base_delay: Duration,
     /// Expected next sequence number.
     expected_seq: Option<u16>,
+    /// Tracks the range of active slots for efficient scanning.
+    /// Oldest unrecovered gap sequence number.
+    scan_lo: u16,
+    /// Number of active (pending) gaps.
+    active_count: u32,
 }
 
 impl NackScheduler {
     pub fn new(max_retries: u32, base_delay: Duration) -> Self {
+        let capacity = 4096usize; // covers ~0.6s at 7000 pps
+        let default_slot = NackSlot {
+            seq: 0,
+            active: false,
+            next_nack_at: Instant::now(),
+            nack_count: 0,
+        };
         Self {
-            pending: BTreeMap::new(),
+            slots: vec![default_slot; capacity],
+            capacity,
             max_retries,
             base_delay,
             expected_seq: None,
+            scan_lo: 0,
+            active_count: 0,
         }
     }
 
@@ -102,36 +138,36 @@ impl NackScheduler {
 
         match self.expected_seq {
             None => {
-                // First packet — initialize expected
                 self.expected_seq = Some(seq.wrapping_add(1));
+                self.scan_lo = seq;
             }
             Some(expected) => {
                 let diff = seq.wrapping_sub(expected) as i16;
                 if diff > 0 {
                     // Gap detected: missing expected through seq-1
-                    let gap_size = diff as u16;
-                    // Cap gap detection to prevent flooding on large jumps
-                    let max_gap = 1000u16;
-                    let effective_gap = gap_size.min(max_gap);
-                    for i in 0..effective_gap {
+                    let gap_size = (diff as u16).min(1000); // cap to prevent flooding
+                    for i in 0..gap_size {
                         let missing = expected.wrapping_add(i);
-                        if !self.pending.contains_key(&missing) {
-                            let entry = NackEntry {
-                                detected_at: now,
+                        let idx = missing as usize & (self.capacity - 1);
+                        let slot = &mut self.slots[idx];
+                        // Only create if this slot isn't already tracking this seq
+                        if !slot.active || slot.seq != missing {
+                            *slot = NackSlot {
+                                seq: missing,
+                                active: true,
                                 next_nack_at: now + self.base_delay,
                                 nack_count: 0,
                             };
-                            self.pending.insert(missing, entry);
+                            self.active_count += 1;
                             new_gaps.push(missing);
                         }
                     }
                     self.expected_seq = Some(seq.wrapping_add(1));
                 } else if diff == 0 {
-                    // Expected packet arrived in order
                     self.expected_seq = Some(seq.wrapping_add(1));
                 } else {
-                    // Out-of-order or retransmitted packet — remove from pending if present
-                    self.pending.remove(&seq);
+                    // Out-of-order or retransmitted — deactivate if pending
+                    self.deactivate(seq);
                 }
             }
         }
@@ -139,49 +175,71 @@ impl NackScheduler {
         new_gaps
     }
 
-    /// Mark a sequence number as recovered (received via retransmission).
+    /// Mark a sequence number as recovered. O(1).
+    #[inline]
     pub fn on_packet_recovered(&mut self, seq: u16) {
-        self.pending.remove(&seq);
+        self.deactivate(seq);
+    }
+
+    #[inline]
+    fn deactivate(&mut self, seq: u16) {
+        let idx = seq as usize & (self.capacity - 1);
+        let slot = &mut self.slots[idx];
+        if slot.active && slot.seq == seq {
+            slot.active = false;
+            self.active_count = self.active_count.saturating_sub(1);
+        }
     }
 
     /// Get the list of sequence numbers that need NACKing now.
-    /// Updates internal state (increments nack_count, schedules next retry).
-    /// Returns sequence numbers to NACK, sorted.
+    /// Scans only active slots. Returns sorted sequence numbers.
     pub fn get_pending_nacks(&mut self, now: Instant, rtt: Option<Duration>) -> Vec<u16> {
-        let retry_delay = rtt.unwrap_or(self.base_delay);
-        let mut to_nack = Vec::new();
-        let mut to_remove = Vec::new();
+        if self.active_count == 0 {
+            return Vec::new();
+        }
 
-        for (&seq, entry) in &mut self.pending {
-            if now >= entry.next_nack_at {
-                if entry.nack_count >= self.max_retries {
-                    // Give up on this packet
-                    to_remove.push(seq);
+        let retry_delay = rtt.unwrap_or(self.base_delay);
+        let mut to_nack = Vec::with_capacity(self.active_count as usize);
+
+        // Scan the full ring — active_count bounds how many we'll find
+        for i in 0..self.capacity {
+            let slot = &mut self.slots[i];
+            if !slot.active {
+                continue;
+            }
+            if now >= slot.next_nack_at {
+                if slot.nack_count >= self.max_retries {
+                    slot.active = false;
+                    self.active_count = self.active_count.saturating_sub(1);
                 } else {
-                    to_nack.push(seq);
-                    entry.nack_count += 1;
-                    entry.next_nack_at = now + retry_delay;
+                    to_nack.push(slot.seq);
+                    slot.nack_count += 1;
+                    slot.next_nack_at = now + retry_delay;
                 }
             }
         }
 
-        for seq in to_remove {
-            self.pending.remove(&seq);
-        }
-
-        to_nack.sort();
+        to_nack.sort_unstable();
         to_nack
     }
 
     /// Number of pending (unrecovered) gaps.
     pub fn pending_count(&self) -> usize {
-        self.pending.len()
+        self.active_count as usize
     }
 
-    /// Number of packets that were given up on (exceeded max retries).
-    /// This is tracked externally — caller should count removals from get_pending_nacks.
     pub fn update_base_delay(&mut self, delay: Duration) {
         self.base_delay = delay;
+    }
+}
+
+impl std::fmt::Debug for NackScheduler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NackScheduler")
+            .field("capacity", &self.capacity)
+            .field("active_count", &self.active_count)
+            .field("max_retries", &self.max_retries)
+            .finish()
     }
 }
 
@@ -190,20 +248,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_retransmit_buffer() {
-        let mut buf = RetransmitBuffer::new(5);
-        for i in 0..5 {
+    fn test_retransmit_buffer_o1() {
+        let mut buf = RetransmitBuffer::new(8); // rounds up to 8
+        assert_eq!(buf.capacity(), 8);
+
+        for i in 0..8u16 {
             buf.insert(i, Bytes::from(vec![i as u8]));
         }
-        assert_eq!(buf.len(), 5);
         assert_eq!(buf.get(0).unwrap().as_ref(), &[0]);
-        assert_eq!(buf.get(4).unwrap().as_ref(), &[4]);
+        assert_eq!(buf.get(7).unwrap().as_ref(), &[7]);
 
-        // Exceeding capacity evicts oldest
-        buf.insert(5, Bytes::from(vec![5]));
-        assert_eq!(buf.len(), 5);
+        // Overwrite slot 0 (seq 8 maps to same index)
+        buf.insert(8, Bytes::from(vec![8]));
+        assert!(buf.get(0).is_none()); // evicted
+        assert_eq!(buf.get(8).unwrap().as_ref(), &[8]);
+    }
+
+    #[test]
+    fn test_retransmit_buffer_stale() {
+        let mut buf = RetransmitBuffer::new(4);
+        buf.insert(0, Bytes::from_static(b"a"));
+        buf.insert(4, Bytes::from_static(b"b")); // overwrites slot 0
         assert!(buf.get(0).is_none());
-        assert!(buf.get(5).is_some());
+        assert_eq!(buf.get(4).unwrap().as_ref(), b"b");
     }
 
     #[test]
@@ -211,11 +278,9 @@ mod tests {
         let mut sched = NackScheduler::new(10, Duration::from_millis(50));
         let now = Instant::now();
 
-        // Receive seq 0
         let gaps = sched.on_packet_received(0, now);
         assert!(gaps.is_empty());
 
-        // Receive seq 3 (missing 1, 2)
         let gaps = sched.on_packet_received(3, now);
         assert_eq!(gaps, vec![1, 2]);
         assert_eq!(sched.pending_count(), 2);
@@ -227,9 +292,8 @@ mod tests {
         let now = Instant::now();
 
         sched.on_packet_received(0, now);
-        sched.on_packet_received(3, now); // gap: 1, 2
+        sched.on_packet_received(3, now);
 
-        // Recover packet 1 (arrived out of order)
         sched.on_packet_recovered(1);
         assert_eq!(sched.pending_count(), 1);
     }
@@ -240,7 +304,7 @@ mod tests {
         let now = Instant::now();
 
         sched.on_packet_received(0, now);
-        sched.on_packet_received(3, now); // gap: 1, 2
+        sched.on_packet_received(3, now);
 
         // Not yet time to NACK
         let nacks = sched.get_pending_nacks(now, None);
@@ -251,14 +315,15 @@ mod tests {
         let nacks = sched.get_pending_nacks(later, None);
         assert_eq!(nacks, vec![1, 2]);
 
-        // After max retries, packets are removed
+        // Second retry
         let much_later = later + Duration::from_millis(60);
         let nacks = sched.get_pending_nacks(much_later, None);
-        assert_eq!(nacks, vec![1, 2]); // second retry
+        assert_eq!(nacks, vec![1, 2]);
 
+        // Exceeded max retries — given up
         let even_later = much_later + Duration::from_millis(60);
         let nacks = sched.get_pending_nacks(even_later, None);
-        assert!(nacks.is_empty()); // given up
+        assert!(nacks.is_empty());
         assert_eq!(sched.pending_count(), 0);
     }
 
@@ -268,8 +333,24 @@ mod tests {
         let now = Instant::now();
 
         sched.on_packet_received(0, now);
-        sched.on_packet_received(3, now); // gap: 1, 2
-        sched.on_packet_received(1, now); // out-of-order delivery of 1
+        sched.on_packet_received(3, now);
+        sched.on_packet_received(1, now); // out-of-order
         assert_eq!(sched.pending_count(), 1); // only 2 remains
+    }
+
+    #[test]
+    fn test_retransmit_buffer_wraparound() {
+        let mut buf = RetransmitBuffer::new(2048);
+        // Insert around the u16 wraparound
+        for seq in 65530..=65535u16 {
+            buf.insert(seq, Bytes::from(vec![seq as u8]));
+        }
+        for seq in 0..5u16 {
+            buf.insert(seq, Bytes::from(vec![seq as u8]));
+        }
+        // All should be retrievable
+        assert!(buf.get(65535).is_some());
+        assert!(buf.get(0).is_some());
+        assert!(buf.get(4).is_some());
     }
 }

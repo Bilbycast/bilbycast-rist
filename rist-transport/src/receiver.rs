@@ -5,11 +5,17 @@
 //! - Incoming RTP media from the sender
 //! - Incoming RTCP (SR, RTT echo) from the sender
 //! - Periodic RTCP RR + SDES + NACK emission
+//!
+//! Hot-path design:
+//! - Receives into pre-allocated BytesMut, freezes the payload slice into
+//!   Bytes for delivery (single allocation per packet, reference-counted)
+//! - NackScheduler uses O(1) ring buffer — no BTreeMap on receive path
+//! - `try_send` for non-blocking delivery to application
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +29,9 @@ use rist_protocol::protocol::rtcp_state::RtcpReceiverState;
 use rist_protocol::protocol::rtt::RttEstimator;
 
 use crate::config::RistSocketConfig;
+
+/// Maximum UDP datagram size we'll receive.
+const MAX_UDP_RECV: usize = 2048;
 
 /// Handle for receiving data from a RIST receiver task.
 pub struct ReceiverHandle {
@@ -64,13 +73,20 @@ async fn receiver_loop(
         NackScheduler::new(config.max_nack_retries, Duration::from_millis(50));
     let mut rtt_estimator = RttEstimator::new(config.rtcp_interval * 10);
 
-    let mut rtp_buf = vec![0u8; 2048];
-    let mut rtcp_buf = vec![0u8; 2048];
-    let mut sender_addr: Option<SocketAddr> = None;
+    // Pre-allocated receive buffers — reused every iteration
+    let mut rtp_buf = BytesMut::with_capacity(MAX_UDP_RECV);
+    let mut rtcp_recv_buf = vec![0u8; MAX_UDP_RECV];
+
     let mut sender_rtcp_addr: Option<SocketAddr> = None;
     let mut rtcp_interval = tokio::time::interval(config.rtcp_interval);
 
+    // Monotonic time base for arrival timestamps
+    let time_base = Instant::now();
+
     loop {
+        // Reset receive buffer capacity for next recv (no alloc if capacity sufficient)
+        rtp_buf.resize(MAX_UDP_RECV, 0);
+
         tokio::select! {
             _ = cancel.cancelled() => {
                 log::info!("RIST receiver shutting down");
@@ -81,42 +97,45 @@ async fn receiver_loop(
             result = rtp_socket.recv_from(&mut rtp_buf) => {
                 let (len, from) = result?;
                 let now = Instant::now();
-                let arrival_us = now.elapsed().as_micros() as u64; // monotonic
+                let arrival_us = now.duration_since(time_base).as_micros() as u64;
 
-                // Learn sender address from first packet
-                if sender_addr.is_none() {
-                    sender_addr = Some(from);
+                // Learn sender RTCP address from first packet
+                if sender_rtcp_addr.is_none() {
                     sender_rtcp_addr = Some(crate::channel::RistChannel::rtcp_addr_for(from));
                     log::info!("RIST receiver: sender detected at {from}");
                 }
 
-                // Parse RTP header
+                // Parse RTP header (no allocation — reads from buffer in place)
                 if let Ok((header, header_size)) = RtpHeader::parse(&rtp_buf[..len]) {
                     let seq = header.sequence_number;
                     let rtp_ts = header.timestamp;
 
-                    // Update RTCP receiver state
+                    // Update RTCP receiver state — O(1) per packet
                     rtcp_state.on_packet_received(seq, rtp_ts, arrival_us);
 
-                    // Detect gaps for NACK scheduling
-                    let new_gaps = nack_scheduler.on_packet_received(seq, now);
-                    if !new_gaps.is_empty() {
-                        log::debug!("RIST receiver: detected gaps: {new_gaps:?}");
-                    }
+                    // Detect gaps for NACK scheduling — O(1) per packet
+                    let _new_gaps = nack_scheduler.on_packet_received(seq, now);
 
-                    // If this was a retransmitted packet, mark as recovered
-                    // (the NackScheduler handles this via on_packet_received for out-of-order)
+                    // Deliver payload to application.
+                    // Truncate to actual received size, split off header, freeze.
+                    // This creates a Bytes from the BytesMut without copying the
+                    // payload data — it's a refcount bump + pointer arithmetic.
+                    rtp_buf.truncate(len);
+                    let _ = rtp_buf.split_to(header_size); // discard header
+                    let payload = rtp_buf.split().freeze(); // zero-copy freeze
 
-                    // Deliver payload to application
-                    let payload = Bytes::copy_from_slice(&rtp_buf[header_size..len]);
                     if tx.try_send(payload).is_err() {
                         log::warn!("RIST receiver: application channel full, dropping packet");
                     }
+
+                    // Re-grow buffer for next recv (reuses existing allocation
+                    // if BytesMut has capacity left; otherwise allocates fresh)
+                    rtp_buf.reserve(MAX_UDP_RECV);
                 }
             }
 
             // Incoming RTCP from sender (SR, RTT echo)
-            result = rtcp_socket.recv_from(&mut rtcp_buf) => {
+            result = rtcp_socket.recv_from(&mut rtcp_recv_buf) => {
                 let (len, from) = result?;
                 let now = Instant::now();
 
@@ -124,14 +143,13 @@ async fn receiver_loop(
                     sender_rtcp_addr = Some(from);
                 }
 
-                if let Ok(compound) = RtcpCompound::parse(&rtcp_buf[..len]) {
+                if let Ok(compound) = RtcpCompound::parse(&rtcp_recv_buf[..len]) {
                     for pkt in &compound.packets {
                         match pkt {
                             RtcpPacket::SenderReport(sr) => {
                                 rtcp_state.on_sr_received(sr, now);
                             }
                             RtcpPacket::App(RistApp::RttEchoRequest(req)) => {
-                                // Respond to RTT echo request
                                 let response = RistApp::RttEchoResponse(
                                     rist_protocol::packet::rtcp_app::RttEchoResponse {
                                         ssrc: req.ssrc,
@@ -160,7 +178,7 @@ async fn receiver_loop(
                 }
             }
 
-            // Periodic RTCP emission
+            // Periodic RTCP emission (not hot path — allocations acceptable)
             _ = rtcp_interval.tick() => {
                 let now = Instant::now();
 
@@ -183,7 +201,6 @@ async fn receiver_loop(
                         packets.push(RtcpPacket::Nack(nack_pkt));
                     }
 
-                    // RTT echo request
                     if config.rtt_echo_enabled && rtt_estimator.should_send_request(now) {
                         let (msw, lsw) = rtt_estimator.generate_request(now);
                         packets.push(RtcpPacket::App(RistApp::RttEchoRequest(RttEchoRequest {
