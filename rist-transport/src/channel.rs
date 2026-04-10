@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
 use thiserror::Error;
@@ -16,6 +17,11 @@ pub enum ChannelError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+/// Default UDP receive buffer size (2 MB) for high-bandwidth media.
+const DEFAULT_RECV_BUFFER: usize = 2 * 1024 * 1024;
+/// Default UDP send buffer size (2 MB).
+const DEFAULT_SEND_BUFFER: usize = 2 * 1024 * 1024;
 
 /// A pair of UDP sockets for RTP (even port) and RTCP (even port + 1).
 pub struct RistChannel {
@@ -39,11 +45,18 @@ impl RistChannel {
 
         let rtcp_addr = SocketAddr::new(rtp_addr.ip(), rtp_addr.port() + 1);
 
-        let rtp = UdpSocket::bind(rtp_addr).await?;
-        let rtcp = UdpSocket::bind(rtcp_addr).await?;
+        let rtp = Self::create_udp_socket(rtp_addr)?;
+        let rtcp = Self::create_udp_socket(rtcp_addr)?;
 
         let local_rtp_addr = rtp.local_addr()?;
         let local_rtcp_addr = rtcp.local_addr()?;
+
+        log::info!(
+            "RIST channel bound: RTP={local_rtp_addr} RTCP={local_rtcp_addr} \
+             (recv_buf={}KB, send_buf={}KB)",
+            DEFAULT_RECV_BUFFER / 1024,
+            DEFAULT_SEND_BUFFER / 1024,
+        );
 
         Ok(RistChannel {
             rtp,
@@ -51,6 +64,26 @@ impl RistChannel {
             local_rtp_addr,
             local_rtcp_addr,
         })
+    }
+
+    /// Create a UDP socket with SO_REUSEADDR and large buffers for media traffic.
+    fn create_udp_socket(addr: SocketAddr) -> Result<UdpSocket, std::io::Error> {
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+
+        // Set large buffers for high-bandwidth media — kernel may cap these
+        // but we request the maximum we need
+        let _ = socket.set_recv_buffer_size(DEFAULT_RECV_BUFFER);
+        let _ = socket.set_send_buffer_size(DEFAULT_SEND_BUFFER);
+
+        socket.bind(&addr.into())?;
+        UdpSocket::from_std(socket.into())
     }
 
     /// Get the remote RTCP address given a remote RTP address.

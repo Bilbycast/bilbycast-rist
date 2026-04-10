@@ -138,9 +138,22 @@ impl RtpPacket {
         // Skip CSRC entries (already accounted for in header_size)
         // Skip extension header if present
         let mut offset = header_size;
-        if header.extension && buf.len() >= offset + 4 {
+        if header.extension {
+            if buf.len() < offset + 4 {
+                return Err(RistError::PacketTooShort {
+                    expected: offset + 4,
+                    actual: buf.len(),
+                });
+            }
             let ext_len_words = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
-            offset += 4 + ext_len_words * 4;
+            let ext_total = 4 + ext_len_words * 4;
+            if buf.len() < offset + ext_total {
+                return Err(RistError::PacketTooShort {
+                    expected: offset + ext_total,
+                    actual: buf.len(),
+                });
+            }
+            offset += ext_total;
         }
         let payload = Bytes::copy_from_slice(&buf[offset..]);
         Ok(RtpPacket { header, payload })

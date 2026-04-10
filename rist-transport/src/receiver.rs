@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use rist_protocol::packet::rtcp::{RtcpCompound, RtcpPacket};
 use rist_protocol::packet::rtcp_app::{RistApp, RttEchoRequest};
 use rist_protocol::packet::rtcp_nack::NackListBuilder;
+use rist_protocol::packet::rtcp_rr::ReceiverReport;
 use rist_protocol::packet::rtp::RtpHeader;
 use rist_protocol::protocol::nack_tracker::NackScheduler;
 use rist_protocol::protocol::rtcp_state::RtcpReceiverState;
@@ -158,8 +159,12 @@ async fn receiver_loop(
                                                     processing_delay_us: 0,
                                                 },
                                             );
+                                            // RFC 3550 Section 6.1: compound RTCP must start with SR or RR
                                             let compound = RtcpCompound {
-                                                packets: vec![RtcpPacket::App(response)],
+                                                packets: vec![
+                                                    RtcpPacket::ReceiverReport(ReceiverReport::empty(ssrc)),
+                                                    RtcpPacket::App(response),
+                                                ],
                                             };
                                             let bytes = compound.serialize();
                                             let _ = rtcp_socket.send_to(&bytes, from).await;

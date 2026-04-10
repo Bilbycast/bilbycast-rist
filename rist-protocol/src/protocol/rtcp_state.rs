@@ -2,7 +2,7 @@
 //!
 //! Tracks the state needed to generate RTCP SR and RR packets per RFC 3550.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::packet::rtcp_rr::{ReceiverReport, ReportBlock};
 use crate::packet::rtcp_sdes::Sdes;
@@ -19,12 +19,14 @@ pub struct RtcpSenderState {
     pub packet_count: u32,
     /// Total payload bytes sent.
     pub octet_count: u32,
-    /// Last RTP timestamp sent.
+    /// Last RTP timestamp sent (from actual RTP packets).
     pub last_rtp_timestamp: u32,
-    /// RTP timestamp clock offset (for NTP-to-RTP mapping).
-    rtp_clock_offset: u32,
-    /// Time when sending started.
-    start_time: Instant,
+    /// Wall-clock time when the last RTP timestamp was captured.
+    last_rtp_wallclock: Option<Instant>,
+    /// RTP clock epoch (Instant) for wall-clock-to-RTP conversion.
+    rtp_ts_epoch: Instant,
+    /// RTP clock epoch (SystemTime) for NTP-aligned timestamp generation.
+    rtp_ts_epoch_system: SystemTime,
     /// Last time an RTCP packet was sent.
     pub last_rtcp_time: Option<Instant>,
     /// RTCP emission interval.
@@ -32,26 +34,33 @@ pub struct RtcpSenderState {
 }
 
 impl RtcpSenderState {
-    pub fn new(ssrc: u32, cname: String, rtcp_interval: Duration) -> Self {
-        let rtp_clock_offset = rand::random::<u32>();
+    pub fn new(
+        ssrc: u32,
+        cname: String,
+        rtcp_interval: Duration,
+        rtp_ts_epoch: Instant,
+        rtp_ts_epoch_system: SystemTime,
+    ) -> Self {
         Self {
             ssrc,
             cname,
             packet_count: 0,
             octet_count: 0,
             last_rtp_timestamp: 0,
-            rtp_clock_offset,
-            start_time: Instant::now(),
+            last_rtp_wallclock: None,
+            rtp_ts_epoch,
+            rtp_ts_epoch_system,
             last_rtcp_time: None,
             rtcp_interval,
         }
     }
 
     /// Record that a packet was sent.
-    pub fn on_packet_sent(&mut self, payload_size: usize, rtp_timestamp: u32) {
+    pub fn on_packet_sent(&mut self, payload_size: usize, rtp_timestamp: u32, now: Instant) {
         self.packet_count += 1;
         self.octet_count += payload_size as u32;
         self.last_rtp_timestamp = rtp_timestamp;
+        self.last_rtp_wallclock = Some(now);
     }
 
     /// Check if it's time to send an RTCP compound packet.
@@ -63,12 +72,23 @@ impl RtcpSenderState {
     }
 
     /// Generate a Sender Report.
+    ///
+    /// The RTP timestamp in the SR corresponds to the same wall-clock instant
+    /// as the NTP timestamp (RFC 3550 Section 6.4.1). Computed from the same
+    /// clock base as the RTP data packets.
     pub fn generate_sr(&mut self, now: Instant) -> SenderReport {
-        let elapsed = now.duration_since(self.start_time);
-        let (ntp_msw, ntp_lsw) = duration_to_ntp(elapsed);
-        let rtp_timestamp = self
-            .rtp_clock_offset
-            .wrapping_add((elapsed.as_micros() as u64 * 90000 / 1_000_000) as u32);
+        let (ntp_msw, ntp_lsw) = system_time_to_ntp(SystemTime::now());
+
+        // NTP-aligned RTP timestamp: same formula as the sender's data path.
+        // NTP_time(now) × 90000, truncated to 32 bits.
+        let elapsed = now.duration_since(self.rtp_ts_epoch);
+        let epoch_unix = self
+            .rtp_ts_epoch_system
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        let ntp_us = (epoch_unix.as_micros() as u64 + NTP_EPOCH_OFFSET * 1_000_000)
+            + elapsed.as_micros() as u64;
+        let rtp_timestamp = (ntp_us * 90 / 1000) as u32;
 
         self.last_rtcp_time = Some(now);
 
@@ -265,13 +285,17 @@ impl RtcpReceiverState {
     }
 }
 
-/// Convert a Duration to NTP timestamp (seconds since 1900-01-01).
+/// NTP epoch offset from Unix epoch: 70 years in seconds.
+const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
+
+/// Convert a SystemTime to NTP timestamp (seconds since 1900-01-01).
 /// Returns (MSW, LSW).
-fn duration_to_ntp(d: Duration) -> (u32, u32) {
-    // NTP epoch offset from Unix epoch: 70 years in seconds
-    const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
-    let secs = d.as_secs() + NTP_EPOCH_OFFSET;
-    let frac = ((d.subsec_nanos() as u64) << 32) / 1_000_000_000;
+fn system_time_to_ntp(time: SystemTime) -> (u32, u32) {
+    let unix_duration = time
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = unix_duration.as_secs() + NTP_EPOCH_OFFSET;
+    let frac = ((unix_duration.subsec_nanos() as u64) << 32) / 1_000_000_000;
     (secs as u32, frac as u32)
 }
 
@@ -282,10 +306,11 @@ mod tests {
     #[test]
     fn test_sender_state_sr_generation() {
         let mut state =
-            RtcpSenderState::new(0x1234, "test".to_string(), Duration::from_millis(100));
+            RtcpSenderState::new(0x1234, "test".to_string(), Duration::from_millis(100), Instant::now(), SystemTime::now());
 
-        state.on_packet_sent(1316, 90000);
-        state.on_packet_sent(1316, 90000 + 3600);
+        let now = Instant::now();
+        state.on_packet_sent(1316, 90000, now);
+        state.on_packet_sent(1316, 90000 + 3600, now);
 
         assert_eq!(state.packet_count, 2);
         assert_eq!(state.octet_count, 2632);
@@ -294,6 +319,24 @@ mod tests {
         assert_eq!(sr.ssrc, 0x1234);
         assert_eq!(sr.sender_packet_count, 2);
         assert_eq!(sr.sender_octet_count, 2632);
+
+        // NTP timestamp should reflect wall-clock time (year 2020+),
+        // not elapsed-since-start (~0 seconds + NTP offset = ~1970)
+        // NTP seconds for 2020-01-01 ≈ 3_786_825_600
+        assert!(
+            sr.ntp_msw > 3_786_825_600,
+            "NTP MSW {} should be > 3_786_825_600 (year 2020+)",
+            sr.ntp_msw
+        );
+    }
+
+    #[test]
+    fn test_system_time_to_ntp() {
+        let (msw, lsw) = system_time_to_ntp(SystemTime::now());
+        // NTP seconds for 2020-01-01 ≈ 3_786_825_600
+        assert!(msw > 3_786_825_600, "NTP MSW should reflect current wall-clock time");
+        // Fractional part should be non-trivial (very unlikely to be exactly 0)
+        let _ = lsw; // Just ensure it doesn't panic
     }
 
     #[test]
@@ -334,7 +377,7 @@ mod tests {
     #[test]
     fn test_should_send_rtcp() {
         let state =
-            RtcpSenderState::new(0x1234, "test".to_string(), Duration::from_millis(100));
+            RtcpSenderState::new(0x1234, "test".to_string(), Duration::from_millis(100), Instant::now(), SystemTime::now());
         assert!(state.should_send_rtcp(Instant::now()));
     }
 }
