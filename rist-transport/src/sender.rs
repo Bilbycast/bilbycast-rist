@@ -66,7 +66,11 @@ async fn sender_loop(
     mut rx: mpsc::Receiver<Bytes>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let ssrc: u32 = rand::random();
+    // Keep SSRC LSB = 0. librist treats an odd SSRC on an RTP data packet as a
+    // retransmission flag (see librist rist-common.c "if (flow_id & 1UL) retry = 1"),
+    // and rejects the first such packet of a flow (`!receiver_queue_has_items && retry`),
+    // so an odd random SSRC causes 100% packet loss against librist ristreceiver.
+    let ssrc: u32 = rand::random::<u32>() & !1u32;
     let cname = config
         .cname
         .unwrap_or_else(|| format!("{}", rtp_socket.local_addr().unwrap()));

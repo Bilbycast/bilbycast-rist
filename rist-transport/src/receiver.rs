@@ -58,7 +58,10 @@ async fn receiver_loop(
     tx: mpsc::Sender<Bytes>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let ssrc: u32 = rand::random();
+    // Keep SSRC LSB = 0 so RTCP RRs/SDES follow the librist convention where the
+    // data-path LSB is reserved as a retransmission flag (see sender.rs for the
+    // full explanation and the librist source reference).
+    let ssrc: u32 = rand::random::<u32>() & !1u32;
     let cname = config
         .cname
         .unwrap_or_else(|| format!("{}", rtp_socket.local_addr().unwrap()));
