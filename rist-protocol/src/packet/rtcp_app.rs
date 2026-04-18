@@ -1,7 +1,17 @@
-//! RTCP APP packets for RTT Echo Request/Response (PT=204).
+//! RTCP APP packets used by RIST (PT=204).
 //!
-//! Optional mechanism added in TR-06-1:2020 Section 5.2.6.
-//! Allows receivers to measure RTT for optimizing NACK timing.
+//! Multiple RIST messages share PT=204 with an ASCII name of `"RIST"`. The
+//! subtype field (5 bits in the count position of the common RTCP header)
+//! selects the payload:
+//!
+//! | Subtype | Meaning                                 | Size |
+//! |--------:|-----------------------------------------|------|
+//! | 0       | Range NACK (librist default, interop)   | 12 + 4·N bytes |
+//! | 2       | RTT Echo Request (TR-06-1:2020 §5.2.6)  | 16 bytes        |
+//! | 3       | RTT Echo Response                       | 20 bytes        |
+//!
+//! `RistApp::parse` accepts any subtype and returns a best-effort variant so
+//! a peer's extension doesn't tear down the whole RTCP compound.
 
 use bytes::{Buf, BufMut, BytesMut};
 
@@ -10,12 +20,16 @@ use crate::error::{RistError, Result};
 /// RTCP packet type for APP.
 pub const RTCP_PT_APP: u8 = 204;
 
+/// Subtype for librist-style Range NACK (PT=204 APP "RIST"). Default NACK
+/// format emitted by librist 0.2.11 unless the application explicitly opts
+/// into the RFC 4585 PT=205 bitmask form.
+pub const RIST_APP_RANGE_NACK: u8 = 0;
 /// Subtype for RTT Echo Request.
 pub const RTT_ECHO_REQUEST: u8 = 2;
 /// Subtype for RTT Echo Response.
 pub const RTT_ECHO_RESPONSE: u8 = 3;
 
-/// ASCII name field for RIST RTT Echo packets.
+/// ASCII name field for RIST APP packets.
 const RIST_APP_NAME: [u8; 4] = *b"RIST";
 
 /// RTT Echo Request packet.
@@ -40,21 +54,62 @@ pub struct RttEchoResponse {
     pub processing_delay_us: u32,
 }
 
+/// librist Range NACK carried inside the APP "RIST" envelope.
+///
+/// Wire layout (after the 4-byte common RTCP header, per
+/// `rist_rtcp_nack_range` in libRIST `src/proto/rtp.h`):
+///
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +---------------------------------------------------------------+
+/// |                      SSRC (media source)                      |
+/// +---------------------------------------------------------------+
+/// |                         "RIST" ASCII                          |
+/// +---------------------------------------------------------------+
+/// |        start #1               |          extra #1             |
+/// +---------------------------------------------------------------+
+/// |        start #N               |          extra #N             |
+/// +---------------------------------------------------------------+
+/// ```
+///
+/// `extra = N` means `N` additional consecutive seqs are lost after `start`,
+/// so the total run is `N + 1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeNack {
+    /// SSRC of the media source whose packets are missing.
+    pub media_ssrc: u32,
+    /// Range entries, each `(start, extra)`.
+    pub entries: Vec<(u16, u16)>,
+}
+
 /// Parsed RIST APP packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RistApp {
     RttEchoRequest(RttEchoRequest),
     RttEchoResponse(RttEchoResponse),
+    /// librist Range NACK carried as PT=204 APP "RIST" subtype 0.
+    RangeNack(RangeNack),
+    /// Any other PT=204 APP "RIST" subtype — preserved to keep the
+    /// compound-level parse lenient. The `data` is the raw payload
+    /// AFTER the common header (i.e., starting with the SSRC field).
+    Unknown { subtype: u8, data: Vec<u8> },
 }
 
 impl RistApp {
     /// Parse from buffer (after common RTCP header has been read).
     /// `subtype` is from the common header (5 bits where RC normally goes).
+    ///
+    /// Unknown subtypes are preserved as [`RistApp::Unknown`] rather than
+    /// returning `Err` — a stray librist extension inside an RTCP compound
+    /// must not cause the peer's NACKs (in an earlier or later sub-packet)
+    /// to be rejected.
     pub fn parse(buf: &[u8], subtype: u8) -> Result<Self> {
-        // Minimum: SSRC(4) + name(4) + timestamp(8)
-        if buf.len() < 16 {
+        // Minimum APP body: SSRC(4) + name(4) = 8 bytes. Everything shorter
+        // is malformed and a hard parse error.
+        if buf.len() < 8 {
             return Err(RistError::PacketTooShort {
-                expected: 16,
+                expected: 8,
                 actual: buf.len(),
             });
         }
@@ -63,28 +118,53 @@ impl RistApp {
         let mut name = [0u8; 4];
         r.copy_to_slice(&mut name);
         if name != RIST_APP_NAME {
-            return Err(RistError::Other(format!(
-                "unexpected APP name: {:?}",
-                name
-            )));
+            // Foreign APP packet inside the compound — treat as unknown
+            // rather than tearing the compound down.
+            return Ok(RistApp::Unknown {
+                subtype,
+                data: buf.to_vec(),
+            });
         }
 
-        let timestamp_msw = r.get_u32();
-        let timestamp_lsw = r.get_u32();
-
         match subtype {
-            RTT_ECHO_REQUEST => Ok(RistApp::RttEchoRequest(RttEchoRequest {
-                ssrc,
-                timestamp_msw,
-                timestamp_lsw,
-            })),
+            RIST_APP_RANGE_NACK => {
+                // librist Range NACK: after SSRC(4) + "RIST"(4), the rest is
+                // an array of (u16 start, u16 extra) entries. Parse all.
+                let mut entries = Vec::with_capacity(r.remaining() / 4);
+                while r.remaining() >= 4 {
+                    let start = r.get_u16();
+                    let extra = r.get_u16();
+                    entries.push((start, extra));
+                }
+                Ok(RistApp::RangeNack(RangeNack {
+                    media_ssrc: ssrc,
+                    entries,
+                }))
+            }
+            RTT_ECHO_REQUEST => {
+                if r.remaining() < 8 {
+                    return Err(RistError::PacketTooShort {
+                        expected: 16,
+                        actual: buf.len(),
+                    });
+                }
+                let timestamp_msw = r.get_u32();
+                let timestamp_lsw = r.get_u32();
+                Ok(RistApp::RttEchoRequest(RttEchoRequest {
+                    ssrc,
+                    timestamp_msw,
+                    timestamp_lsw,
+                }))
+            }
             RTT_ECHO_RESPONSE => {
-                if r.remaining() < 4 {
+                if r.remaining() < 12 {
                     return Err(RistError::PacketTooShort {
                         expected: 20,
                         actual: buf.len(),
                     });
                 }
+                let timestamp_msw = r.get_u32();
+                let timestamp_lsw = r.get_u32();
                 let processing_delay_us = r.get_u32();
                 Ok(RistApp::RttEchoResponse(RttEchoResponse {
                     ssrc,
@@ -93,9 +173,10 @@ impl RistApp {
                     processing_delay_us,
                 }))
             }
-            _ => Err(RistError::Other(format!(
-                "unknown RTT Echo subtype: {subtype}"
-            ))),
+            _ => Ok(RistApp::Unknown {
+                subtype,
+                data: buf.to_vec(),
+            }),
         }
     }
 
@@ -127,6 +208,32 @@ impl RistApp {
                 buf.put_u32(resp.timestamp_msw);
                 buf.put_u32(resp.timestamp_lsw);
                 buf.put_u32(resp.processing_delay_us);
+                buf
+            }
+            RistApp::RangeNack(nack) => {
+                // Header(4) + SSRC(4) + name(4) + N * range(4)
+                let total = 12 + 4 * nack.entries.len();
+                let length_words = (total / 4) - 1;
+                let mut buf = BytesMut::with_capacity(total);
+                buf.put_u8(0x80 | RIST_APP_RANGE_NACK);
+                buf.put_u8(RTCP_PT_APP);
+                buf.put_u16(length_words as u16);
+                buf.put_u32(nack.media_ssrc);
+                buf.put_slice(&RIST_APP_NAME);
+                for (start, extra) in &nack.entries {
+                    buf.put_u16(*start);
+                    buf.put_u16(*extra);
+                }
+                buf
+            }
+            RistApp::Unknown { subtype, data } => {
+                let total = 4 + data.len();
+                let length_words = (total / 4).saturating_sub(1);
+                let mut buf = BytesMut::with_capacity(total);
+                buf.put_u8(0x80 | (*subtype & 0x1F));
+                buf.put_u8(RTCP_PT_APP);
+                buf.put_u16(length_words as u16);
+                buf.put_slice(data);
                 buf
             }
         }

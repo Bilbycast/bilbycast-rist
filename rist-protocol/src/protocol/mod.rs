@@ -2,6 +2,7 @@
 
 pub mod bonding;
 pub mod nack_tracker;
+pub mod reorder;
 pub mod rtcp_state;
 pub mod rtt;
 

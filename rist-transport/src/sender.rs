@@ -13,6 +13,8 @@
 //! - NACK processing avoids Vec allocation for small NACK lists
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut, BufMut};
@@ -28,6 +30,7 @@ use rist_protocol::protocol::rtcp_state::RtcpSenderState;
 use rist_protocol::protocol::rtt::RttEstimator;
 
 use crate::config::RistSocketConfig;
+use crate::stats::RistConnStats;
 
 /// Maximum RTP packet size (header + payload).
 const MAX_RTP_PACKET: usize = 1500;
@@ -44,12 +47,13 @@ pub fn spawn_sender(
     rtcp_socket: UdpSocket,
     remote_rtp_addr: SocketAddr,
     cancel: CancellationToken,
+    stats: Arc<RistConnStats>,
 ) -> (SenderHandle, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<Bytes>(256);
 
     let handle = tokio::spawn(async move {
         if let Err(e) =
-            sender_loop(config, rtp_socket, rtcp_socket, remote_rtp_addr, rx, cancel).await
+            sender_loop(config, rtp_socket, rtcp_socket, remote_rtp_addr, rx, cancel, stats).await
         {
             log::error!("RIST sender task exited with error: {e}");
         }
@@ -65,6 +69,7 @@ async fn sender_loop(
     remote_rtp_addr: SocketAddr,
     mut rx: mpsc::Receiver<Bytes>,
     cancel: CancellationToken,
+    stats: Arc<RistConnStats>,
 ) -> anyhow::Result<()> {
     // Keep SSRC LSB = 0. librist treats an odd SSRC on an RTP data packet as a
     // retransmission flag (see librist rist-common.c "if (flow_id & 1UL) retry = 1"),
@@ -90,6 +95,11 @@ async fn sender_loop(
 
     // Pre-allocated buffers — reused every iteration, zero hot-path allocs
     let mut send_buf = BytesMut::with_capacity(MAX_RTP_PACKET);
+    // Retransmit scratch buffer: we can't mutate the buffered `Bytes` in-place
+    // because it may be referenced elsewhere, so copy once per retransmit and
+    // flip the SSRC LSB in the copy. Cap is `MAX_RTP_PACKET` so the Vec never
+    // re-allocates on resend.
+    let mut retx_buf = BytesMut::with_capacity(MAX_RTP_PACKET);
     let mut rtcp_recv_buf = vec![0u8; 2048];
 
     let mut remote_rtcp_addr = crate::channel::RistChannel::rtcp_addr_for(remote_rtp_addr);
@@ -130,6 +140,9 @@ async fn sender_loop(
                 // Send RTP via connected socket (no address lookup)
                 if let Err(e) = rtp_socket.send_to(&send_buf, remote_rtp_addr).await {
                     log::warn!("RTP send error: {e}");
+                } else {
+                    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    stats.bytes_sent.fetch_add(send_buf.len() as u64, Ordering::Relaxed);
                 }
 
                 rtcp_state.on_packet_sent(payload.len(), rtp_timestamp, now);
@@ -144,18 +157,49 @@ async fn sender_loop(
                     log::info!("RIST sender: learned receiver RTCP address {from} (was {remote_rtcp_addr})");
                     remote_rtcp_addr = from;
                 }
+                // Trace: dump the first 64 bytes of every RTCP packet we
+                // receive until we know the peer NACK format. Remove once
+                // interop is proven. Gated at `trace` so it's silent by
+                // default.
+                log::trace!(
+                    "RIST sender: received {} RTCP bytes: {:02x?}",
+                    len,
+                    &rtcp_recv_buf[..len.min(256)]
+                );
                 if let Ok(compound) = RtcpCompound::parse(&rtcp_recv_buf[..len]) {
+                    log::trace!(
+                        "RIST sender: RTCP compound parsed, {} sub-packets",
+                        compound.packets.len()
+                    );
                     for pkt in &compound.packets {
+                        log::trace!("RIST sender: RTCP sub-packet: {:?}", pkt);
                         match pkt {
                             RtcpPacket::Nack(nack) => {
-                                // Retransmit requested packets — iterate without allocating
+                                // Retransmit requested packets — iterate without allocating.
+                                //
+                                // Each retransmit must flip the SSRC LSB to 1 so librist's
+                                // receiver (which uses `flow_id & 1` as the retry flag — see
+                                // libRIST `rist-common.c`) counts these as retransmits rather
+                                // than fresh data. The buffered packet has LSB=0; we copy into
+                                // `retx_buf` once and flip byte 11 (low byte of the SSRC u32
+                                // in big-endian wire order) for each send. Zero allocations
+                                // on the hot path thanks to `retx_buf` re-use.
+                                let mut requested: u64 = 0;
+                                let mut retransmitted: u64 = 0;
                                 match &nack.entries {
                                     rist_protocol::packet::rtcp_nack::NackEntries::Bitmask(v) => {
                                         for nack_entry in v {
                                             for lost_seq in nack_entry.lost_seqs() {
+                                                requested += 1;
                                                 if let Some(pkt_data) = retransmit_buf.get(lost_seq) {
-                                                    // Zero-copy: Bytes is refcounted
-                                                    let _ = rtp_socket.send_to(pkt_data, remote_rtp_addr).await;
+                                                    retx_buf.clear();
+                                                    retx_buf.extend_from_slice(pkt_data);
+                                                    if retx_buf.len() > 11 {
+                                                        retx_buf[11] |= 0x01;
+                                                    }
+                                                    if rtp_socket.send_to(&retx_buf, remote_rtp_addr).await.is_ok() {
+                                                        retransmitted += 1;
+                                                    }
                                                 }
                                             }
                                         }
@@ -163,13 +207,23 @@ async fn sender_loop(
                                     rist_protocol::packet::rtcp_nack::NackEntries::Range(v) => {
                                         for nack_entry in v {
                                             for lost_seq in nack_entry.lost_seqs() {
+                                                requested += 1;
                                                 if let Some(pkt_data) = retransmit_buf.get(lost_seq) {
-                                                    let _ = rtp_socket.send_to(pkt_data, remote_rtp_addr).await;
+                                                    retx_buf.clear();
+                                                    retx_buf.extend_from_slice(pkt_data);
+                                                    if retx_buf.len() > 11 {
+                                                        retx_buf[11] |= 0x01;
+                                                    }
+                                                    if rtp_socket.send_to(&retx_buf, remote_rtp_addr).await.is_ok() {
+                                                        retransmitted += 1;
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
+                                stats.nacks_received.fetch_add(requested, Ordering::Relaxed);
+                                stats.packets_retransmitted.fetch_add(retransmitted, Ordering::Relaxed);
                             }
                             RtcpPacket::App(RistApp::RttEchoRequest(req)) => {
                                 let response = RistApp::RttEchoResponse(
@@ -197,6 +251,38 @@ async fn sender_loop(
                                     resp.timestamp_lsw,
                                     resp.processing_delay_us,
                                 );
+                                if let Some(rtt) = rtt_estimator.srtt() {
+                                    stats.rtt_us.store(
+                                        rtt.as_micros() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                }
+                            }
+                            RtcpPacket::App(RistApp::RangeNack(nack)) => {
+                                // librist's default NACK format (PT=204 APP
+                                // "RIST" subtype 0). Each entry covers a run
+                                // of seqs: `start` and `extra` more after it.
+                                let mut requested: u64 = 0;
+                                let mut retransmitted: u64 = 0;
+                                for (start, extra) in &nack.entries {
+                                    let count = (*extra as u32) + 1;
+                                    for i in 0..count {
+                                        let lost_seq = start.wrapping_add(i as u16);
+                                        requested += 1;
+                                        if let Some(pkt_data) = retransmit_buf.get(lost_seq) {
+                                            retx_buf.clear();
+                                            retx_buf.extend_from_slice(pkt_data);
+                                            if retx_buf.len() > 11 {
+                                                retx_buf[11] |= 0x01;
+                                            }
+                                            if rtp_socket.send_to(&retx_buf, remote_rtp_addr).await.is_ok() {
+                                                retransmitted += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                stats.nacks_received.fetch_add(requested, Ordering::Relaxed);
+                                stats.packets_retransmitted.fetch_add(retransmitted, Ordering::Relaxed);
                             }
                             _ => {}
                         }

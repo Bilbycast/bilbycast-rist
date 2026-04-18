@@ -30,7 +30,29 @@ pub struct RtpHeader {
     /// RTP timestamp (32 bits, clock rate depends on payload type).
     pub timestamp: u32,
     /// Synchronization source identifier.
+    ///
+    /// RIST (per librist convention in `rist-common.c` — `if (flow_id & 1)
+    /// retry = 1;`) reserves the least-significant bit of the SSRC on RTP
+    /// data packets as a retransmit flag: LSB=0 for fresh media, LSB=1 for
+    /// NACK-driven retransmits. Use [`RtpHeader::is_retransmit`] and
+    /// [`RtpHeader::logical_ssrc`] to extract the real SSRC and the flag.
     pub ssrc: u32,
+}
+
+impl RtpHeader {
+    /// Returns true when the RIST retransmit flag is set on this packet's
+    /// SSRC. Only meaningful on RTP data packets sent by a RIST peer.
+    #[inline]
+    pub fn is_retransmit(&self) -> bool {
+        self.ssrc & 1 != 0
+    }
+
+    /// The SSRC with the retransmit flag cleared — use this whenever
+    /// comparing SSRCs across retransmitted and fresh packets.
+    #[inline]
+    pub fn logical_ssrc(&self) -> u32 {
+        self.ssrc & !1
+    }
 }
 
 impl RtpHeader {

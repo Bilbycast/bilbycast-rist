@@ -68,21 +68,35 @@ cargo build --release
 |---------|--------|
 | RTP parsing/serialization | Done |
 | RTCP SR/RR/SDES | Done |
-| RTCP NACK (bitmask + range) | Done |
-| RTCP RTT Echo Request/Response | Done |
-| RTCP compound packets | Done |
+| RTCP NACK — PT=205 RTPFB bitmask (FMT=1) | Send + parse |
+| RTCP NACK — PT=205 RTPFB range (FMT=15) | Parse |
+| RTCP NACK — PT=204 APP "RIST" range (librist default, subtype 0) | **Parse — verified against librist 0.2.11** |
+| RIST retransmit flag (RTP SSRC LSB=1) | Send + parse (authoritative `retransmits_received` stat) |
+| RTCP RTT Echo Request/Response (APP "RIST" subtypes 2/3) | Done |
+| RTCP XR PT=77 (librist RRT extension) | Tolerated (lenient compound parse) |
+| RTCP compound packets (lenient parse) | Done — unknown sub-packets preserved, don't abort compound |
 | 16-bit sequence arithmetic | Done |
 | RTCP sender/receiver state | Done |
+| Receiver-side reorder / jitter buffer (`protocol::reorder::ReorderBuffer`) | Done |
+| Fast NACK pump (10 ms tick, RTT-scaled retry delay) | Done |
 | NACK-based retransmission | Done |
 | RTT estimation (EWMA) | Done |
-| SMPTE 2022-7 bonding | Done |
+| SMPTE 2022-7 bonding | Done (protocol layer) |
 | Async sender/receiver tasks | Done |
 | Dual-port UDP channel | Done |
-| GRE-over-UDP tunneling | Stubbed |
-| PSK encryption (AES-CTR) | Stubbed |
-| DTLS 1.2 encryption | Stubbed |
-| Null packet deletion | Stubbed |
-| bilbycast-edge integration | Not started |
+| Shared stats handle (`RistConnStats`) | Done (Arc<AtomicU64>, lock-free) |
+| GRE-over-UDP tunneling (Main Profile) | Stubbed — separate sprint |
+| Main Profile peer multiplexing | Stubbed — separate sprint |
+| DTLS 1.2 encryption (Main Profile) | Stubbed — separate sprint |
+| PSK encryption (AES-CTR, Main Profile) | Stubbed — separate sprint |
+| Null-packet deletion | Stubbed |
+| bilbycast-edge integration | **Done** — wire-verified with librist 0.2.11 ARQ matrix, both directions |
+
+## Interop Status (Simple Profile)
+
+**100 % bidirectional interoperability with librist 0.2.11 Simple Profile has been achieved** under adverse-network conditions (10 % loss / 200 ms delay / 50 ms jitter on both RTP and RTCP paths). See `testbed/RIST_ARQ_TEST.md` for the full test matrix and post-run stats cross-checks.
+
+Remaining gaps are **Main Profile + DTLS + AES-CTR + null-packet deletion**, all tracked as dedicated follow-up sprints. The Simple Profile data-plane is stable, stats are authoritative, and the retransmit-flag accounting matches librist's expectations.
 
 ## Inter-Project Dependencies
 

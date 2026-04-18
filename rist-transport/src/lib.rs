@@ -10,6 +10,7 @@ pub mod listener;
 pub mod receiver;
 pub mod sender;
 pub mod socket;
+pub mod stats;
 pub mod stats_poller;
 
 // Stubbed for future phases
@@ -18,3 +19,4 @@ pub mod tunnel_task;
 
 pub use config::RistSocketConfig;
 pub use socket::RistSocket;
+pub use stats::{RistConnStats, RistConnStatsSnapshot, RistRole};

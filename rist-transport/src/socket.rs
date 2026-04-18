@@ -1,6 +1,7 @@
 //! RistSocket — the main public API for RIST connections.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -10,6 +11,7 @@ use crate::channel::RistChannel;
 use crate::config::RistSocketConfig;
 use crate::receiver::{self, ReceiverHandle};
 use crate::sender::{self, SenderHandle};
+use crate::stats::{RistConnStats, RistRole};
 
 /// A RIST socket that can send or receive media.
 pub struct RistSocket {
@@ -19,6 +21,10 @@ pub struct RistSocket {
     receiver: Option<ReceiverHandle>,
     /// Cancellation token for shutdown.
     cancel: CancellationToken,
+    /// Shared connection-level stats, populated by the sender / receiver task.
+    stats: Arc<RistConnStats>,
+    /// Socket role (sender or receiver).
+    role: RistRole,
     /// Task handles.
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -31,6 +37,7 @@ impl RistSocket {
     ) -> Result<Self, crate::channel::ChannelError> {
         let channel = RistChannel::bind(config.local_addr).await?;
         let cancel = CancellationToken::new();
+        let stats = RistConnStats::new();
 
         let (sender_handle, task) = sender::spawn_sender(
             config,
@@ -38,12 +45,15 @@ impl RistSocket {
             channel.rtcp,
             remote_addr,
             cancel.clone(),
+            stats.clone(),
         );
 
         Ok(RistSocket {
             sender: Some(sender_handle),
             receiver: None,
             cancel,
+            stats,
+            role: RistRole::Sender,
             _tasks: vec![task],
         })
     }
@@ -54,18 +64,22 @@ impl RistSocket {
     ) -> Result<Self, crate::channel::ChannelError> {
         let channel = RistChannel::bind(config.local_addr).await?;
         let cancel = CancellationToken::new();
+        let stats = RistConnStats::new();
 
         let (receiver_handle, task) = receiver::spawn_receiver(
             config,
             channel.rtp,
             channel.rtcp,
             cancel.clone(),
+            stats.clone(),
         );
 
         Ok(RistSocket {
             sender: None,
             receiver: Some(receiver_handle),
             cancel,
+            stats,
+            role: RistRole::Receiver,
             _tasks: vec![task],
         })
     }
@@ -86,6 +100,16 @@ impl RistSocket {
         } else {
             None
         }
+    }
+
+    /// Shared stats handle — readers and the underlying task share this Arc.
+    pub fn stats(&self) -> Arc<RistConnStats> {
+        self.stats.clone()
+    }
+
+    /// Whether this socket was created in sender or receiver mode.
+    pub fn role(&self) -> RistRole {
+        self.role
     }
 
     /// Shut down the socket.

@@ -104,27 +104,43 @@ impl RtcpCompound {
 
             let payload = &buf[offset + 4..offset + pkt_size];
 
+            // Parse sub-packets lazily and leniently: any per-packet parse
+            // error demotes the sub-packet to `Unknown` instead of tearing
+            // the whole compound down. librist interop relies on this —
+            // peer extensions (XR echo PT=77 pre-0.2.8, new APP subtypes,
+            // etc.) must not block the NACK that followed in the same
+            // datagram.
             let pkt = match header.packet_type {
-                RTCP_PT_SR => {
-                    let sr = SenderReport::parse(payload)?;
-                    RtcpPacket::SenderReport(sr)
-                }
-                RTCP_PT_RR => {
-                    let rr = ReceiverReport::parse(payload, header.count)?;
-                    RtcpPacket::ReceiverReport(rr)
-                }
-                RTCP_PT_SDES => {
-                    let sdes = Sdes::parse(payload)?;
-                    RtcpPacket::Sdes(sdes)
-                }
-                RTCP_PT_RTPFB => {
-                    let nack = NackPacket::parse(payload, header.count, payload.len())?;
-                    RtcpPacket::Nack(nack)
-                }
-                RTCP_PT_APP => {
-                    let app = RistApp::parse(payload, header.count)?;
-                    RtcpPacket::App(app)
-                }
+                RTCP_PT_SR => SenderReport::parse(payload)
+                    .map(RtcpPacket::SenderReport)
+                    .unwrap_or_else(|_| RtcpPacket::Unknown {
+                        packet_type: header.packet_type,
+                        data: payload.to_vec(),
+                    }),
+                RTCP_PT_RR => ReceiverReport::parse(payload, header.count)
+                    .map(RtcpPacket::ReceiverReport)
+                    .unwrap_or_else(|_| RtcpPacket::Unknown {
+                        packet_type: header.packet_type,
+                        data: payload.to_vec(),
+                    }),
+                RTCP_PT_SDES => Sdes::parse(payload)
+                    .map(RtcpPacket::Sdes)
+                    .unwrap_or_else(|_| RtcpPacket::Unknown {
+                        packet_type: header.packet_type,
+                        data: payload.to_vec(),
+                    }),
+                RTCP_PT_RTPFB => NackPacket::parse(payload, header.count, payload.len())
+                    .map(RtcpPacket::Nack)
+                    .unwrap_or_else(|_| RtcpPacket::Unknown {
+                        packet_type: header.packet_type,
+                        data: payload.to_vec(),
+                    }),
+                RTCP_PT_APP => RistApp::parse(payload, header.count)
+                    .map(RtcpPacket::App)
+                    .unwrap_or_else(|_| RtcpPacket::Unknown {
+                        packet_type: header.packet_type,
+                        data: payload.to_vec(),
+                    }),
                 pt => RtcpPacket::Unknown {
                     packet_type: pt,
                     data: payload.to_vec(),
