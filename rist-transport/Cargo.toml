@@ -14,7 +14,7 @@ log = "0.4"
 thiserror = "2.0"
 anyhow = "1.0"
 tokio-util = "0.7"
-rand = "0.9"
+rand = "0.10"
 
 [dev-dependencies]
 env_logger = "0.11"

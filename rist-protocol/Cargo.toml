@@ -13,7 +13,7 @@ main-profile = ["dep:serde", "dep:serde_json"]
 [dependencies]
 bytes = "1.11"
 log = "0.4"
-rand = "0.9"
+rand = "0.10"
 thiserror = "2.0"
 
 # Optional: PSK encryption
