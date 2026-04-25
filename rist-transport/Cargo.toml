@@ -7,7 +7,7 @@ license = "MPL-2.0"
 
 [dependencies]
 rist-protocol = { path = "../rist-protocol" }
-tokio = { version = "1.51", features = ["net", "rt-multi-thread", "time", "sync", "macros"] }
+tokio = { version = "1.52", features = ["net", "rt-multi-thread", "time", "sync", "macros"] }
 socket2 = "0.6"
 bytes = "1.11"
 log = "0.4"

@@ -17,8 +17,8 @@ rand = "0.10"
 thiserror = "2.0"
 
 # Optional: PSK encryption
-aes = { version = "0.8", optional = true }
-ctr = { version = "0.9", optional = true }
+aes = { version = "0.9", optional = true }
+ctr = { version = "0.10", optional = true }
 
 # Optional: Main Profile (GRE keep-alive JSON)
 serde = { version = "1.0", features = ["derive"], optional = true }
