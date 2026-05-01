@@ -25,3 +25,7 @@ credentials.*
 # Test artifacts
 /tmp/
 *.log
+
+# Claude Code — share settings.json, keep per-host launch.json + project state local
+.claude/*
+!.claude/settings.json
