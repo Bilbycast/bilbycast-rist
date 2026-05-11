@@ -4,6 +4,7 @@ version = "0.3.0"
 edition = "2024"
 description = "Async RIST transport layer built on tokio"
 license = "MPL-2.0"
+publish = false
 
 [dependencies]
 rist-protocol = { path = "../rist-protocol" }
