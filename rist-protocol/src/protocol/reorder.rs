@@ -51,6 +51,11 @@ pub struct InsertOutcome {
     /// Number of sequence slots newly flagged as gaps because this packet
     /// pushed `highest_seq` forward across empty positions.
     pub new_gaps: u32,
+    /// Number of buffered-but-undelivered packets discarded because the ring
+    /// overflowed (base stuck behind an unrecoverable gap while fresher
+    /// packets arrived). These are a TLPKTDROP loss — the oldest are dropped
+    /// so fresh media keeps flowing. 0 in the normal case.
+    pub overflow_flushed: u32,
 }
 
 /// Item produced by `drain_ready`.
@@ -140,13 +145,54 @@ impl ReorderBuffer {
             return outcome;
         }
 
-        // If the packet is farther ahead than the ring can hold, drop it —
-        // accepting would corrupt slots in use for lower seqs. This keeps
-        // the invariant that every index in the active window maps uniquely.
+        // If the packet is farther ahead than the ring can hold, the base is
+        // stuck behind an unrecoverable gap while fresher packets pile up.
+        // Rather than drop the FRESH packet (the old behaviour — which
+        // stalls delivery until the stuck head times out, up to buffer_time,
+        // a real glitch at high bitrate), flush the OLDEST forward (TLPKTDROP,
+        // matching libsrt) so fresh media keeps flowing.
         let ahead_capacity = self.capacity as u16 - 1;
         if (from_base as u16) > ahead_capacity {
-            outcome.stale = true;
-            return outcome;
+            let advance = (from_base as u16) - ahead_capacity;
+            let new_base = base.wrapping_add(advance);
+            // Reset entirely when the jump is huge (>= one ring) or when it
+            // flushes past everything we've buffered (highest within the
+            // flushed span) — anything else leaves a consistent window
+            // [new_base, highest] with the kept tail intact.
+            let highest_offset = highest.wrapping_sub(base);
+            if advance as usize >= self.capacity || highest_offset < advance {
+                let mut flushed = 0u32;
+                for slot in self.slots.iter_mut() {
+                    if matches!(slot.state, SlotState::Filled { .. }) {
+                        flushed += 1;
+                    }
+                    *slot = Slot { seq: 0, state: SlotState::Empty };
+                }
+                let idx = (seq as usize) & self.mask;
+                self.slots[idx] = Slot {
+                    seq,
+                    state: SlotState::Filled { data, arrival: now },
+                };
+                self.base_seq = Some(seq);
+                self.highest_seq = Some(seq);
+                outcome.overflow_flushed = flushed;
+                return outcome;
+            }
+            // Minimal flush: drop [base, new_base), keep [new_base, highest].
+            let mut flushed = 0u32;
+            for i in 0..advance {
+                let s = base.wrapping_add(i);
+                let sidx = (s as usize) & self.mask;
+                if self.slots[sidx].seq == s
+                    && matches!(self.slots[sidx].state, SlotState::Filled { .. })
+                {
+                    flushed += 1;
+                }
+                self.slots[sidx] = Slot { seq: 0, state: SlotState::Empty };
+            }
+            self.base_seq = Some(new_base);
+            outcome.overflow_flushed = flushed;
+            // Fall through to insert `seq` — now within [new_base, new_base+cap).
         }
 
         let idx = (seq as usize) & self.mask;
@@ -451,5 +497,56 @@ mod tests {
         let t0 = Instant::now();
         buf.insert(10, b(1), t0);
         assert_eq!(buf.next_drain_time(), Some(t0 + Duration::from_millis(100)));
+    }
+
+    /// Ring overflow (base stuck behind an unrecoverable gap while fresher
+    /// packets fill the window) must flush the OLDEST and keep the fresh
+    /// packet, not drop the fresh one and stall (TLPKTDROP, like libsrt).
+    #[test]
+    fn overflow_flushes_oldest_not_freshest() {
+        let mut buf = ReorderBuffer::with_capacity(Duration::from_millis(10), 64);
+        let t0 = Instant::now();
+        // Anchor at 10, fill the window [10, 73] up to 72.
+        for s in 10u16..=72 {
+            buf.insert(s, b((s & 0xff) as u8), t0);
+        }
+        // 74 is one past the window (ahead_capacity = 63) -> overflow.
+        let o = buf.insert(74, b(74), t0);
+        assert!(o.overflow_flushed >= 1, "overflow must flush the stuck head");
+        let mut out = Vec::new();
+        buf.drain_ready(t0 + Duration::from_millis(20), &mut out);
+        let delivered: Vec<u8> = out
+            .iter()
+            .filter_map(|i| match i {
+                DrainItem::Delivered { data, .. } => Some(data[0]),
+                DrainItem::Lost => None,
+            })
+            .collect();
+        assert!(delivered.contains(&74), "fresh packet must survive overflow");
+        assert!(delivered.contains(&11), "kept tail must still deliver");
+        assert!(!delivered.contains(&10), "oldest (flushed) must be gone");
+    }
+
+    /// A forward jump larger than a ring width is a discontinuity: reset and
+    /// anchor at the new packet (only it survives).
+    #[test]
+    fn overflow_huge_jump_resets() {
+        let mut buf = ReorderBuffer::with_capacity(Duration::from_millis(10), 64);
+        let t0 = Instant::now();
+        for s in 10u16..=30 {
+            buf.insert(s, b((s & 0xff) as u8), t0);
+        }
+        let o = buf.insert(510, b(99), t0); // +500 jump (>> ring)
+        assert!(o.overflow_flushed >= 1, "reset must report flushed buffered packets");
+        let mut out = Vec::new();
+        buf.drain_ready(t0 + Duration::from_millis(20), &mut out);
+        let delivered: Vec<u8> = out
+            .iter()
+            .filter_map(|i| match i {
+                DrainItem::Delivered { data, .. } => Some(data[0]),
+                DrainItem::Lost => None,
+            })
+            .collect();
+        assert_eq!(delivered, vec![99], "only the post-reset packet survives");
     }
 }

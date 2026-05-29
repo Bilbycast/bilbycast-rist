@@ -177,7 +177,22 @@ impl RtcpReceiverState {
     /// `seq` is the 16-bit RTP sequence number.
     /// `rtp_timestamp` is the RTP timestamp from the packet.
     /// `arrival_time_us` is the local arrival time in microseconds (monotonic).
-    pub fn on_packet_received(&mut self, seq: u16, rtp_timestamp: u32, arrival_time_us: u64) {
+    /// `is_duplicate` is true when the reorder buffer already held this seq
+    /// (e.g. a retransmit arriving after the original). Duplicates must not
+    /// inflate `packets_received` — that would under-report loss in the RR
+    /// (received approaching/exceeding expected) — nor perturb the RFC 3550
+    /// jitter EWMA, since a retransmit's late arrival is not representative
+    /// of the media cadence.
+    pub fn on_packet_received(
+        &mut self,
+        seq: u16,
+        rtp_timestamp: u32,
+        arrival_time_us: u64,
+        is_duplicate: bool,
+    ) {
+        if is_duplicate {
+            return;
+        }
         if !self.first_packet_received {
             self.first_packet_received = true;
             self.base_seq = seq;
@@ -346,7 +361,7 @@ mod tests {
 
         // Receive packets in order
         for i in 0..100u16 {
-            state.on_packet_received(i, i as u32 * 3600, i as u64 * 40_000);
+            state.on_packet_received(i, i as u32 * 3600, i as u64 * 40_000, false);
         }
 
         assert_eq!(state.packets_received, 100);
@@ -358,6 +373,23 @@ mod tests {
     }
 
     #[test]
+    fn duplicates_do_not_inflate_received_or_jitter() {
+        let mut state =
+            RtcpReceiverState::new(0x5678, "receiver".to_string(), Duration::from_millis(100));
+        for i in 0..50u16 {
+            state.on_packet_received(i, i as u32 * 3600, i as u64 * 40_000, false);
+        }
+        let jitter_before = state.jitter;
+        // Replay 10 packets as duplicates (e.g. retransmits after the
+        // originals) — must not count toward received nor move jitter.
+        for i in 0..10u16 {
+            state.on_packet_received(i, i as u32 * 3600, 9_999_999, true);
+        }
+        assert_eq!(state.packets_received, 50, "duplicates must not inflate received");
+        assert_eq!(state.jitter, jitter_before, "duplicates must not perturb jitter");
+    }
+
+    #[test]
     fn test_receiver_state_with_loss() {
         let mut state =
             RtcpReceiverState::new(0x5678, "receiver".to_string(), Duration::from_millis(100));
@@ -365,7 +397,7 @@ mod tests {
         // Receive packets with a gap (skip seq 5)
         for i in 0..10u16 {
             if i != 5 {
-                state.on_packet_received(i, i as u32 * 3600, i as u64 * 40_000);
+                state.on_packet_received(i, i as u32 * 3600, i as u64 * 40_000, false);
             }
         }
 

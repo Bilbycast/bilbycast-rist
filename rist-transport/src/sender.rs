@@ -152,6 +152,7 @@ async fn sender_loop(
             // Incoming RTCP from receiver (NACKs, RTT echo responses)
             result = rtcp_socket.recv_from(&mut rtcp_recv_buf) => {
                 let (len, from) = result?;
+                let recv_at = Instant::now();
                 // Learn receiver's actual RTCP address from first incoming packet
                 if from != remote_rtcp_addr {
                     log::info!("RIST sender: learned receiver RTCP address {from} (was {remote_rtcp_addr})");
@@ -184,41 +185,39 @@ async fn sender_loop(
                                 // `retx_buf` once and flip byte 11 (low byte of the SSRC u32
                                 // in big-endian wire order) for each send. Zero allocations
                                 // on the hot path thanks to `retx_buf` re-use.
+                                // Cap retransmits served per NACK so a huge
+                                // loss-burst NACK can't block this select! task
+                                // (which also sends fresh media) on hundreds of
+                                // awaited send_to calls — that would starve the
+                                // live stream during recovery. Excess seqs are
+                                // still counted as `requested`; the receiver
+                                // re-NACKs any still-missing ones next round.
+                                const MAX_RETX_PER_NACK: u64 = 512;
                                 let mut requested: u64 = 0;
                                 let mut retransmitted: u64 = 0;
-                                match &nack.entries {
+                                let mut served: u64 = 0;
+                                let seqs: Vec<u16> = match &nack.entries {
                                     rist_protocol::packet::rtcp_nack::NackEntries::Bitmask(v) => {
-                                        for nack_entry in v {
-                                            for lost_seq in nack_entry.lost_seqs() {
-                                                requested += 1;
-                                                if let Some(pkt_data) = retransmit_buf.get(lost_seq) {
-                                                    retx_buf.clear();
-                                                    retx_buf.extend_from_slice(pkt_data);
-                                                    if retx_buf.len() > 11 {
-                                                        retx_buf[11] |= 0x01;
-                                                    }
-                                                    if rtp_socket.send_to(&retx_buf, remote_rtp_addr).await.is_ok() {
-                                                        retransmitted += 1;
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        v.iter().flat_map(|e| e.lost_seqs()).collect()
                                     }
                                     rist_protocol::packet::rtcp_nack::NackEntries::Range(v) => {
-                                        for nack_entry in v {
-                                            for lost_seq in nack_entry.lost_seqs() {
-                                                requested += 1;
-                                                if let Some(pkt_data) = retransmit_buf.get(lost_seq) {
-                                                    retx_buf.clear();
-                                                    retx_buf.extend_from_slice(pkt_data);
-                                                    if retx_buf.len() > 11 {
-                                                        retx_buf[11] |= 0x01;
-                                                    }
-                                                    if rtp_socket.send_to(&retx_buf, remote_rtp_addr).await.is_ok() {
-                                                        retransmitted += 1;
-                                                    }
-                                                }
-                                            }
+                                        v.iter().flat_map(|e| e.lost_seqs()).collect()
+                                    }
+                                };
+                                for lost_seq in seqs {
+                                    requested += 1;
+                                    if served >= MAX_RETX_PER_NACK {
+                                        continue;
+                                    }
+                                    if let Some(pkt_data) = retransmit_buf.get(lost_seq) {
+                                        retx_buf.clear();
+                                        retx_buf.extend_from_slice(pkt_data);
+                                        if retx_buf.len() > 11 {
+                                            retx_buf[11] |= 0x01;
+                                        }
+                                        served += 1;
+                                        if rtp_socket.send_to(&retx_buf, remote_rtp_addr).await.is_ok() {
+                                            retransmitted += 1;
                                         }
                                     }
                                 }
@@ -226,12 +225,15 @@ async fn sender_loop(
                                 stats.packets_retransmitted.fetch_add(retransmitted, Ordering::Relaxed);
                             }
                             RtcpPacket::App(RistApp::RttEchoRequest(req)) => {
+                                // Report our actual receive→respond turnaround so
+                                // the requester can subtract it from the measured
+                                // RTT (was hard-coded 0, biasing SRT/NACK-retry high).
                                 let response = RistApp::RttEchoResponse(
                                     rist_protocol::packet::rtcp_app::RttEchoResponse {
                                         ssrc: req.ssrc,
                                         timestamp_msw: req.timestamp_msw,
                                         timestamp_lsw: req.timestamp_lsw,
-                                        processing_delay_us: 0,
+                                        processing_delay_us: recv_at.elapsed().as_micros().min(u32::MAX as u128) as u32,
                                     },
                                 );
                                 // RFC 3550 Section 6.1: compound RTCP must start with SR or RR

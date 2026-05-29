@@ -37,7 +37,7 @@ use rist_protocol::packet::rtcp_nack::NackListBuilder;
 use rist_protocol::packet::rtcp_rr::ReceiverReport;
 use rist_protocol::packet::rtp::RtpHeader;
 use rist_protocol::protocol::nack_tracker::NackScheduler;
-use rist_protocol::protocol::reorder::{DrainItem, ReorderBuffer};
+use rist_protocol::protocol::reorder::{DrainItem, InsertOutcome, ReorderBuffer};
 use rist_protocol::protocol::rtcp_state::RtcpReceiverState;
 use rist_protocol::protocol::rtt::RttEstimator;
 
@@ -52,6 +52,31 @@ const NACK_PUMP_INTERVAL: Duration = Duration::from_millis(10);
 /// Lower bound for NACK retry delay so we never spam. RTT-driven delay
 /// wins when we have a sample; otherwise we fall back to this.
 const MIN_NACK_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+/// A parsed RTP media packet awaiting batch insert into the reorder buffer.
+struct ParsedRtp {
+    seq: u16,
+    rtp_ts: u32,
+    payload: Bytes,
+    arrival_us: u64,
+    payload_len: usize,
+    is_retransmit: bool,
+}
+
+/// Parse one RTP datagram: validate the header, copy the payload (the recv
+/// buffer is reused across a batch), and stamp the true UDP-arrival time
+/// (monotonic µs from `epoch`). Returns None on a malformed/short datagram.
+fn parse_rtp(buf: &[u8], epoch: Instant) -> Option<ParsedRtp> {
+    let (header, header_size) = RtpHeader::parse(buf).ok()?;
+    Some(ParsedRtp {
+        seq: header.sequence_number,
+        rtp_ts: header.timestamp,
+        payload: Bytes::copy_from_slice(&buf[header_size..]),
+        arrival_us: Instant::now().duration_since(epoch).as_micros() as u64,
+        payload_len: buf.len() - header_size,
+        is_retransmit: header.is_retransmit(),
+    })
+}
 
 /// A packet delivered to the application by the receiver, in RTP seq order.
 #[derive(Debug, Clone)]
@@ -240,70 +265,83 @@ async fn receiver_loop(
                 break;
             }
 
-            // Incoming RTP media
+            // Incoming RTP media. Drain a bounded burst (this datagram plus
+            // any already-queued ones via try_recv_from) and insert the whole
+            // batch under ONE buffer lock + ONE delivery-thread wake, instead
+            // of locking/notifying per packet — cuts recv<->delivery-thread
+            // lock contention at high packet rates. MAX_BATCH bounds it so the
+            // RTCP / NACK select arms aren't starved.
             result = rtp_socket.recv_from(&mut rtp_buf) => {
                 match result {
                     Ok((len, from)) => {
-                        let now = Instant::now();
-                        let arrival_us = now.duration_since(epoch).as_micros() as u64;
-
-                        // Learn sender RTCP address from first packet
                         if sender_rtcp_addr.is_none() {
                             sender_rtcp_addr = Some(crate::channel::RistChannel::rtcp_addr_for(from));
                             log::info!("RIST receiver: sender detected at {from}");
                         }
 
-                        // Parse RTP header
-                        match RtpHeader::parse(&rtp_buf[..len]) {
-                            Ok((header, header_size)) => {
-                                let seq = header.sequence_number;
-                                let rtp_ts = header.timestamp;
-                                let payload_len = len - header_size;
-                                let is_retransmit = header.is_retransmit();
+                        const MAX_BATCH: usize = 32;
+                        let mut batch: Vec<ParsedRtp> = Vec::with_capacity(MAX_BATCH);
+                        if let Some(p) = parse_rtp(&rtp_buf[..len], epoch) {
+                            batch.push(p);
+                        } else {
+                            log::debug!("RTP parse error, len={len}");
+                        }
+                        while batch.len() < MAX_BATCH {
+                            match rtp_socket.try_recv_from(&mut rtp_buf) {
+                                Ok((l, _)) => {
+                                    if let Some(p) = parse_rtp(&rtp_buf[..l], epoch) {
+                                        batch.push(p);
+                                    }
+                                }
+                                Err(_) => break, // WouldBlock (nothing more ready) or error
+                            }
+                        }
 
-                                // Update RTCP receiver state (RR stats + jitter)
-                                rtcp_state.on_packet_received(seq, rtp_ts, arrival_us);
+                        if !batch.is_empty() {
+                            let now = Instant::now();
+                            // One lock for the whole burst; `now` is the true
+                            // UDP-arrival anchor carried through to delivery.
+                            let mut outcomes: Vec<InsertOutcome> =
+                                Vec::with_capacity(batch.len());
+                            {
+                                let mut g = shared.reorder.lock()
+                                    .unwrap_or_else(|p| p.into_inner());
+                                for p in &batch {
+                                    outcomes.push(g.insert(p.seq, p.payload.clone(), now));
+                                }
+                            }
+                            shared.signal.notify_one();
 
-                                // Detect gaps for NACK scheduling — also handles
-                                // recovery (out-of-order arrivals deactivate pending
-                                // NACKs for that seq).
-                                nack_scheduler.on_packet_received(seq, now);
-
-                                // Store in reorder buffer, stripping the RTP header.
-                                // `now` is the true UDP arrival — it rides through
-                                // the buffer and is surfaced on delivery.
-                                let payload = Bytes::copy_from_slice(&rtp_buf[header_size..len]);
-                                let outcome = {
-                                    let mut g = shared.reorder.lock()
-                                        .unwrap_or_else(|p| p.into_inner());
-                                    g.insert(seq, payload, now)
-                                };
-                                // Wake the delivery thread: a new packet may
-                                // have shortened the head deadline.
-                                shared.signal.notify_one();
-
+                            for (p, o) in batch.iter().zip(outcomes.iter()) {
+                                // is_duplicate keeps duplicate retransmits out
+                                // of the RFC3550 received count + jitter EWMA.
+                                rtcp_state.on_packet_received(p.seq, p.rtp_ts, p.arrival_us, o.duplicate);
+                                nack_scheduler.on_packet_received(p.seq, now);
                                 stats.packets_received.fetch_add(1, Ordering::Relaxed);
-                                stats.bytes_received.fetch_add(payload_len as u64, Ordering::Relaxed);
-                                if is_retransmit {
+                                stats.bytes_received.fetch_add(p.payload_len as u64, Ordering::Relaxed);
+                                if p.is_retransmit {
                                     stats.retransmits_received.fetch_add(1, Ordering::Relaxed);
                                 }
-                                if outcome.duplicate {
+                                if o.duplicate {
                                     stats.duplicates.fetch_add(1, Ordering::Relaxed);
                                 }
-                                if outcome.recovered {
+                                if o.recovered {
                                     stats.packets_recovered.fetch_add(1, Ordering::Relaxed);
                                 }
-                                if outcome.stale {
+                                if o.stale {
                                     stats.reorder_drops.fetch_add(1, Ordering::Relaxed);
                                 }
-                                stats.jitter_us.store(
-                                    (rtcp_state.jitter * 1_000_000.0 / 90_000.0) as u64,
-                                    Ordering::Relaxed,
-                                );
+                                if o.overflow_flushed > 0 {
+                                    // TLPKTDROP: oldest buffered packets dropped
+                                    // to keep fresh media flowing under a stuck gap.
+                                    stats.packets_lost.fetch_add(
+                                        o.overflow_flushed as u64, Ordering::Relaxed);
+                                }
                             }
-                            Err(e) => {
-                                log::debug!("RTP parse error: {e}, len={len}");
-                            }
+                            stats.jitter_us.store(
+                                (rtcp_state.jitter * 1_000_000.0 / 90_000.0) as u64,
+                                Ordering::Relaxed,
+                            );
                         }
                     }
                     Err(e) => {
@@ -335,7 +373,8 @@ async fn receiver_loop(
                                                     ssrc: req.ssrc,
                                                     timestamp_msw: req.timestamp_msw,
                                                     timestamp_lsw: req.timestamp_lsw,
-                                                    processing_delay_us: 0,
+                                                    // Real receive→respond turnaround (was 0).
+                                                    processing_delay_us: now.elapsed().as_micros().min(u32::MAX as u128) as u32,
                                                 },
                                             );
                                             // RFC 3550 Section 6.1: compound RTCP must start with SR or RR
