@@ -18,10 +18,15 @@ pub enum ChannelError {
     Io(#[from] std::io::Error),
 }
 
-/// Default UDP receive buffer size (2 MB) for high-bandwidth media.
-const DEFAULT_RECV_BUFFER: usize = 2 * 1024 * 1024;
-/// Default UDP send buffer size (2 MB).
-const DEFAULT_SEND_BUFFER: usize = 2 * 1024 * 1024;
+/// Default UDP receive buffer size (32 MB) for high-bandwidth media.
+/// Matches the project's capture-hygiene standard (testbed gate 11): a
+/// 2 MB buffer overflows at ~20 Mbps during a brief scheduler/drain stall
+/// and the kernel-dropped packets resurface as spurious NACKs + jitter.
+/// The kernel silently caps this at `net.core.rmem_max`, so the actual
+/// applied size is logged after the set.
+const DEFAULT_RECV_BUFFER: usize = 32 * 1024 * 1024;
+/// Default UDP send buffer size (32 MB).
+const DEFAULT_SEND_BUFFER: usize = 32 * 1024 * 1024;
 
 /// A pair of UDP sockets for RTP (even port) and RTCP (even port + 1).
 pub struct RistChannel {
@@ -78,9 +83,20 @@ impl RistChannel {
         socket.set_nonblocking(true)?;
 
         // Set large buffers for high-bandwidth media — kernel may cap these
-        // but we request the maximum we need
+        // (silently, at net.core.rmem_max / wmem_max) but we request the
+        // maximum we need, then read back the applied size so operators can
+        // see capping in the logs.
         let _ = socket.set_recv_buffer_size(DEFAULT_RECV_BUFFER);
         let _ = socket.set_send_buffer_size(DEFAULT_SEND_BUFFER);
+        let applied_rcv = socket.recv_buffer_size().unwrap_or(0);
+        if applied_rcv < DEFAULT_RECV_BUFFER {
+            log::warn!(
+                "RIST UDP {addr}: requested SO_RCVBUF {} KB but kernel applied {} KB \
+                 (raise net.core.rmem_max to avoid drops at high bitrate)",
+                DEFAULT_RECV_BUFFER / 1024,
+                applied_rcv / 1024,
+            );
+        }
 
         socket.bind(&addr.into())?;
         UdpSocket::from_std(socket.into())

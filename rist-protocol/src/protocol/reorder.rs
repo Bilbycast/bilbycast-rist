@@ -55,8 +55,13 @@ pub struct InsertOutcome {
 
 /// Item produced by `drain_ready`.
 pub enum DrainItem {
-    /// Packet payload (header stripped).
-    Delivered(Bytes),
+    /// A packet ready for delivery, in RTP sequence order. Carries the
+    /// wire RTP `seq` (so the transport layer can drive a real-seq 2022-7
+    /// merger) and the `arrival` Instant captured at true UDP receive
+    /// (pre-reorder-hold) so the consumer can recover the genuine arrival
+    /// cadence — the timestamp the source-PCR PLL needs to lock, rather
+    /// than the post-hold delivery time.
+    Delivered { data: Bytes, seq: u16, arrival: Instant },
     /// Gap timed out — no retransmit arrived within `buffer_time`.
     Lost,
 }
@@ -228,14 +233,14 @@ impl ReorderBuffer {
             match &slot.state {
                 SlotState::Filled { arrival, .. } => {
                     if now.saturating_duration_since(*arrival) >= self.buffer_time {
-                        let payload = match std::mem::replace(
+                        let (data, arrival) = match std::mem::replace(
                             &mut slot.state,
                             SlotState::Empty,
                         ) {
-                            SlotState::Filled { data, .. } => data,
+                            SlotState::Filled { data, arrival } => (data, arrival),
                             _ => unreachable!(),
                         };
-                        out.push(DrainItem::Delivered(payload));
+                        out.push(DrainItem::Delivered { data, seq: base, arrival });
                         self.base_seq = Some(base.wrapping_add(1));
                         continue;
                     }
@@ -307,7 +312,7 @@ mod tests {
         let got: Vec<u8> = items
             .iter()
             .filter_map(|i| match i {
-                DrainItem::Delivered(b) => Some(b[0]),
+                DrainItem::Delivered { data, .. } => Some(data[0]),
                 DrainItem::Lost => None,
             })
             .collect();
@@ -356,7 +361,7 @@ mod tests {
         let items = collect(&mut buf, t0 + Duration::from_millis(200));
         let mut iter = items.iter();
         match iter.next() {
-            Some(DrainItem::Delivered(b)) if b[0] == 1 => {}
+            Some(DrainItem::Delivered { data, .. }) if data[0] == 1 => {}
             _ => panic!("expected delivery of seq 10"),
         }
         match iter.next() {
@@ -364,7 +369,7 @@ mod tests {
             _ => panic!("expected lost marker for seq 11"),
         }
         match iter.next() {
-            Some(DrainItem::Delivered(b)) if b[0] == 3 => {}
+            Some(DrainItem::Delivered { data, .. }) if data[0] == 3 => {}
             _ => panic!("expected delivery of seq 12"),
         }
     }
@@ -405,6 +410,38 @@ mod tests {
 
         let items = collect(&mut buf, t0 + Duration::from_millis(10));
         assert_delivered(&items, &[1, 2, 3, 4]);
+    }
+
+    /// Guards the assumption the receiver's precise-drain timer relies on:
+    /// `next_drain_time()` reports the head packet's exact
+    /// `arrival + buffer_time` deadline, not a poll cadence. A drainer that
+    /// woke only on the next arrival (~2 ms apart at broadcast rates) or the
+    /// 10 ms NACK pump would release each packet up to one inter-arrival
+    /// late — the delivery-phase jitter the cell12 fix removed (2026-05-21).
+    #[test]
+    fn next_drain_time_matches_release_deadline_not_poll_cadence() {
+        let hold = Duration::from_millis(1000);
+        let mut buf = ReorderBuffer::new(hold);
+        let t0 = Instant::now();
+        buf.insert(100, b(1), t0);
+        // Second packet arrives one broadcast inter-arrival later.
+        let t1 = t0 + Duration::from_micros(2106);
+        buf.insert(101, b(2), t1);
+
+        // The head (seq 100) is released at exactly t0 + hold, independent
+        // of when seq 101 arrived.
+        let deadline = buf.next_drain_time().expect("head has a deadline");
+        assert_eq!(deadline, t0 + hold);
+
+        let mut out = Vec::new();
+        buf.drain_ready(deadline - Duration::from_micros(1), &mut out);
+        assert!(out.is_empty(), "must not release before the deadline");
+        buf.drain_ready(deadline, &mut out);
+        assert_delivered(&out, &[1]);
+
+        // Next deadline is seq 101's own arrival + hold (not the poll tick).
+        let next = buf.next_drain_time().expect("seq 101 still held");
+        assert_eq!(next, t1 + hold);
     }
 
     #[test]

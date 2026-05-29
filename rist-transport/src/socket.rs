@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::channel::RistChannel;
 use crate::config::RistSocketConfig;
-use crate::receiver::{self, ReceiverHandle};
+use crate::receiver::{self, ReceiverHandle, RistDelivered};
 use crate::sender::{self, SenderHandle};
 use crate::stats::{RistConnStats, RistRole};
 
@@ -93,8 +93,17 @@ impl RistSocket {
         }
     }
 
-    /// Receive data (receiver mode only).
+    /// Receive a payload (receiver mode only). Convenience wrapper that
+    /// drops the delivery metadata; callers that need the true UDP arrival
+    /// time or wire RTP seq (e.g. for source-PCR-PLL feed or 2022-7 merge)
+    /// should use [`recv_delivered`](Self::recv_delivered).
     pub async fn recv(&mut self) -> Option<Bytes> {
+        self.recv_delivered().await.map(|d| d.data)
+    }
+
+    /// Receive the next packet with its delivery metadata: payload + true
+    /// UDP-arrival `Instant` (captured pre-reorder-hold) + wire RTP seq.
+    pub async fn recv_delivered(&mut self) -> Option<RistDelivered> {
         if let Some(receiver) = &mut self.receiver {
             receiver.rx.recv().await
         } else {

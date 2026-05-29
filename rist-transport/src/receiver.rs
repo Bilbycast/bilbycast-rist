@@ -1,23 +1,29 @@
 //! RIST receiver task.
 //!
-//! Owns the RTCP receiver state, NACK scheduler, RTT estimator, and the
-//! receiver-side reorder / jitter buffer. Runs as a tokio task with a
-//! `select!` loop handling:
-//! - Incoming RTP media from the sender (stored in the reorder buffer)
-//! - Incoming RTCP (SR, RTT echo) from the sender
-//! - A fast pump tick that drains the reorder buffer in-order and emits
-//!   any pending NACKs
-//! - A periodic RTCP tick that emits RR + SDES and optionally an RTT
-//!   echo request
+//! Two-thread design (mirrors libsrt's recv + TSBPD split):
+//!
+//! - **Recv task** (tokio `select!`): reads RTP + RTCP off the sockets,
+//!   runs the RTCP receiver state / NACK scheduler / RTT estimator,
+//!   inserts each media packet into the shared reorder buffer, and wakes
+//!   the delivery thread. Emits NACKs + RR/SDES on their timers.
+//! - **Delivery thread** (dedicated `std::thread`): owns nothing but the
+//!   release timing. It blocks on a condvar timed-wait until the head
+//!   packet's exact `arrival + buffer_size` deadline, then drains ready
+//!   packets in strict RTP sequence order and forwards them to the
+//!   application channel. A single-purpose thread blocked precisely on
+//!   the next deadline gives SRT-parity egress timing — far tighter than
+//!   a tokio timer-wheel tick contending with recv work on one task.
 //!
 //! Delivery semantics: packets are held for `buffer_size` so NACK-driven
 //! retransmits have a chance to fill gaps before downstream sees them,
-//! then released to the application in strict RTP sequence order. Gaps
-//! that age past the hold budget are dropped and counted as lost.
+//! then released in strict RTP sequence order. Gaps that age past the
+//! hold budget are dropped and counted as lost. Each delivered packet
+//! carries its true UDP-arrival `Instant` (captured pre-hold) and wire
+//! RTP seq via [`RistDelivered`].
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -40,17 +46,44 @@ use crate::stats::RistConnStats;
 
 /// Maximum UDP datagram size we'll receive.
 const MAX_UDP_RECV: usize = 2048;
-/// Fast pump interval: drives reorder-buffer drain and NACK emission.
-/// Short enough to keep NACK-to-wire latency well under the typical
-/// buffer_size, long enough to batch coincident losses.
+/// Fast pump interval: drives NACK emission (NOT delivery — that is the
+/// dedicated thread's job).
 const NACK_PUMP_INTERVAL: Duration = Duration::from_millis(10);
 /// Lower bound for NACK retry delay so we never spam. RTT-driven delay
 /// wins when we have a sample; otherwise we fall back to this.
 const MIN_NACK_RETRY_DELAY: Duration = Duration::from_millis(20);
 
+/// A packet delivered to the application by the receiver, in RTP seq order.
+#[derive(Debug, Clone)]
+pub struct RistDelivered {
+    /// RTP payload (header stripped) — the MPEG-TS bytes.
+    pub data: Bytes,
+    /// Instant the packet was first read off the UDP socket — its TRUE
+    /// arrival, captured BEFORE the reorder/jitter hold. The consumer
+    /// recovers the genuine arrival cadence (what the source-PCR PLL must
+    /// see to lock) via `Instant::now() - arrival`, instead of the
+    /// post-hold delivery time which carries the full hold + drain jitter.
+    pub arrival: Instant,
+    /// Wire RTP sequence number — shared across 2022-7 redundant legs, so
+    /// the transport consumer can run a real-seq hitless merger.
+    pub rtp_seq: u16,
+}
+
 /// Handle for receiving data from a RIST receiver task.
 pub struct ReceiverHandle {
-    pub rx: mpsc::Receiver<Bytes>,
+    pub rx: mpsc::Receiver<RistDelivered>,
+}
+
+/// Shared reorder buffer + its wake signal, between the recv task (which
+/// inserts) and the dedicated delivery thread (which drains). The mutex
+/// critical sections are tiny — a single O(1) `insert` ring write, or a
+/// `drain_ready` loop that pops only already-expired head slots — and the
+/// actual `try_send` happens outside the lock, so neither side stalls the
+/// other. This is the one place the crate's "tasks own state" rule is
+/// relaxed; it matches libsrt's recv-thread/TSBPD-thread mutex exactly.
+struct DrainShared {
+    reorder: Mutex<ReorderBuffer>,
+    signal: Condvar,
 }
 
 /// Spawn a RIST receiver task.
@@ -61,7 +94,7 @@ pub fn spawn_receiver(
     cancel: CancellationToken,
     stats: Arc<RistConnStats>,
 ) -> (ReceiverHandle, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel::<Bytes>(1024);
+    let (tx, rx) = mpsc::channel::<RistDelivered>(1024);
 
     let handle = tokio::spawn(async move {
         if let Err(e) = receiver_loop(config, rtp_socket, rtcp_socket, tx, cancel, stats).await {
@@ -72,11 +105,82 @@ pub fn spawn_receiver(
     (ReceiverHandle { rx }, handle)
 }
 
+/// Dedicated delivery thread. Blocks on a condvar timed-wait until the
+/// head packet's `arrival + buffer_size` deadline (or a new insert wakes
+/// it earlier), drains everything ready in seq order, and forwards it.
+/// Exits when `cancel` fires (the recv task notifies on shutdown).
+fn run_drain_thread(
+    shared: Arc<DrainShared>,
+    tx: mpsc::Sender<RistDelivered>,
+    stats: Arc<RistConnStats>,
+    cancel: CancellationToken,
+) {
+    let mut scratch: Vec<DrainItem> = Vec::with_capacity(64);
+    loop {
+        let mut guard = shared
+            .reorder
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if cancel.is_cancelled() {
+            return;
+        }
+        let now = Instant::now();
+        scratch.clear();
+        guard.drain_ready(now, &mut scratch);
+        if scratch.is_empty() {
+            // Nothing ready — wait until the head's deadline or a new
+            // insert. The guard is passed into wait/wait_timeout, which
+            // atomically releases it, so an insert+notify between here and
+            // the wait cannot be lost.
+            match guard.next_drain_time() {
+                None => {
+                    // Empty buffer: park until the recv task notifies. Drop
+                    // the re-acquired guard immediately so the next loop
+                    // iteration can re-lock and drain.
+                    drop(shared.signal.wait(guard));
+                }
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if deadline > now {
+                        drop(shared.signal.wait_timeout(guard, deadline - now));
+                    }
+                    // deadline already passed → loop and drain_ready clears it.
+                }
+            }
+            continue;
+        }
+        drop(guard);
+        // Deliver outside the lock so an insert never blocks on the channel.
+        for item in scratch.drain(..) {
+            match item {
+                DrainItem::Delivered { data, seq, arrival } => {
+                    if tx
+                        .try_send(RistDelivered {
+                            data,
+                            arrival,
+                            rtp_seq: seq,
+                        })
+                        .is_err()
+                    {
+                        // Consumer backed up — drop rather than stall the
+                        // delivery thread. Bumping `reorder_drops` keeps the
+                        // lost-vs-backpressure signals distinguishable.
+                        stats.reorder_drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                DrainItem::Lost => {
+                    stats.packets_lost.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
 async fn receiver_loop(
     config: RistSocketConfig,
     rtp_socket: UdpSocket,
     rtcp_socket: UdpSocket,
-    tx: mpsc::Sender<Bytes>,
+    tx: mpsc::Sender<RistDelivered>,
     cancel: CancellationToken,
     stats: Arc<RistConnStats>,
 ) -> anyhow::Result<()> {
@@ -90,10 +194,23 @@ async fn receiver_loop(
         .unwrap_or_else(|| format!("{}", rtp_socket.local_addr().unwrap()));
 
     let mut rtcp_state = RtcpReceiverState::new(ssrc, cname, config.rtcp_interval);
-    let mut nack_scheduler =
-        NackScheduler::new(config.max_nack_retries, MIN_NACK_RETRY_DELAY);
+    let mut nack_scheduler = NackScheduler::new(config.max_nack_retries, MIN_NACK_RETRY_DELAY);
     let mut rtt_estimator = RttEstimator::new(config.rtcp_interval * 10);
-    let mut reorder = ReorderBuffer::new(config.buffer_size);
+
+    // Shared reorder buffer + the dedicated delivery thread.
+    let shared = Arc::new(DrainShared {
+        reorder: Mutex::new(ReorderBuffer::new(config.buffer_size)),
+        signal: Condvar::new(),
+    });
+    let drain_handle = {
+        let shared = shared.clone();
+        let stats = stats.clone();
+        let cancel = cancel.clone();
+        std::thread::Builder::new()
+            .name("rist-drain".into())
+            .spawn(move || run_drain_thread(shared, tx, stats, cancel))
+            .expect("spawn rist-drain thread")
+    };
 
     // Pre-allocated receive buffers
     let mut rtp_buf = vec![0u8; MAX_UDP_RECV];
@@ -101,10 +218,13 @@ async fn receiver_loop(
 
     let mut sender_rtcp_addr: Option<SocketAddr> = None;
     let mut rtcp_interval = tokio::time::interval(config.rtcp_interval);
-    // Fast pump for reorder drain + early NACK emission.
+    // Fast pump for NACK emission (delivery is the drain thread's job now).
     let mut pump_interval = tokio::time::interval(NACK_PUMP_INTERVAL);
-    // Scratch buffer re-used across drain calls to avoid per-tick allocation.
-    let mut drained: Vec<DrainItem> = Vec::with_capacity(32);
+
+    // Stable monotonic epoch for true interarrival jitter (RFC 3550): the
+    // RTCP receiver state needs a real arrival timestamp, not the ~0 that
+    // `now.elapsed()` (right after `Instant::now()`) used to produce.
+    let epoch = Instant::now();
 
     log::info!(
         "RIST receiver loop started on RTP={} RTCP={} buffer={}ms",
@@ -125,7 +245,7 @@ async fn receiver_loop(
                 match result {
                     Ok((len, from)) => {
                         let now = Instant::now();
-                        let arrival_us = now.elapsed().as_micros() as u64;
+                        let arrival_us = now.duration_since(epoch).as_micros() as u64;
 
                         // Learn sender RTCP address from first packet
                         if sender_rtcp_addr.is_none() {
@@ -150,8 +270,17 @@ async fn receiver_loop(
                                 nack_scheduler.on_packet_received(seq, now);
 
                                 // Store in reorder buffer, stripping the RTP header.
+                                // `now` is the true UDP arrival — it rides through
+                                // the buffer and is surfaced on delivery.
                                 let payload = Bytes::copy_from_slice(&rtp_buf[header_size..len]);
-                                let outcome = reorder.insert(seq, payload, now);
+                                let outcome = {
+                                    let mut g = shared.reorder.lock()
+                                        .unwrap_or_else(|p| p.into_inner());
+                                    g.insert(seq, payload, now)
+                                };
+                                // Wake the delivery thread: a new packet may
+                                // have shortened the head deadline.
+                                shared.signal.notify_one();
 
                                 stats.packets_received.fetch_add(1, Ordering::Relaxed);
                                 stats.bytes_received.fetch_add(payload_len as u64, Ordering::Relaxed);
@@ -171,8 +300,6 @@ async fn receiver_loop(
                                     (rtcp_state.jitter * 1_000_000.0 / 90_000.0) as u64,
                                     Ordering::Relaxed,
                                 );
-
-                                drain_reorder(&mut reorder, &tx, &stats, now, &mut drained).await;
                             }
                             Err(e) => {
                                 log::debug!("RTP parse error: {e}, len={len}");
@@ -254,10 +381,9 @@ async fn receiver_loop(
                 }
             }
 
-            // Fast pump: drain reorder buffer + emit any pending NACKs.
+            // Fast pump: emit any pending NACKs.
             _ = pump_interval.tick() => {
                 let now = Instant::now();
-                drain_reorder(&mut reorder, &tx, &stats, now, &mut drained).await;
 
                 if let Some(rtcp_dest) = sender_rtcp_addr {
                     let rtt = rtt_estimator.srtt();
@@ -289,7 +415,6 @@ async fn receiver_loop(
             // Periodic RR + SDES emission (and scheduled RTT echo)
             _ = rtcp_interval.tick() => {
                 let now = Instant::now();
-                drain_reorder(&mut reorder, &tx, &stats, now, &mut drained).await;
 
                 if let Some(rtcp_dest) = sender_rtcp_addr {
                     let rr = rtcp_state.generate_rr(now);
@@ -319,35 +444,13 @@ async fn receiver_loop(
         }
     }
 
-    Ok(())
-}
+    // Wake the delivery thread so it observes cancellation and exits, then
+    // join it so no detached thread outlives the socket (shutdown hygiene).
+    shared.signal.notify_all();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = drain_handle.join();
+    })
+    .await;
 
-/// Drain packets whose hold time has elapsed, forwarding to the app channel
-/// in strict sequence order. Gaps that timed out without a retransmit are
-/// counted as lost so downstream stats stay accurate.
-async fn drain_reorder(
-    reorder: &mut ReorderBuffer,
-    tx: &mpsc::Sender<Bytes>,
-    stats: &Arc<RistConnStats>,
-    now: Instant,
-    scratch: &mut Vec<DrainItem>,
-) {
-    scratch.clear();
-    reorder.drain_ready(now, scratch);
-    for item in scratch.drain(..) {
-        match item {
-            DrainItem::Delivered(payload) => {
-                if tx.try_send(payload).is_err() {
-                    // Application consumer is backed up — drop rather than
-                    // stall the reorder pump. Bumping `reorder_drops` keeps
-                    // the lost vs. sender/receiver backpressure signals
-                    // distinguishable in stats.
-                    stats.reorder_drops.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            DrainItem::Lost => {
-                stats.packets_lost.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
+    Ok(())
 }

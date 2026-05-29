@@ -144,22 +144,36 @@ impl NackScheduler {
             Some(expected) => {
                 let diff = seq.wrapping_sub(expected) as i16;
                 if diff > 0 {
-                    // Gap detected: missing expected through seq-1
-                    let gap_size = (diff as u16).min(1000); // cap to prevent flooding
-                    for i in 0..gap_size {
-                        let missing = expected.wrapping_add(i);
-                        let idx = missing as usize & (self.capacity - 1);
-                        let slot = &mut self.slots[idx];
-                        // Only create if this slot isn't already tracking this seq
-                        if !slot.active || slot.seq != missing {
-                            *slot = NackSlot {
-                                seq: missing,
-                                active: true,
-                                next_nack_at: now + self.base_delay,
-                                nack_count: 0,
-                            };
-                            self.active_count += 1;
-                            new_gaps.push(missing);
+                    // Forward gap: `expected ..= seq-1` are missing.
+                    //
+                    // A gap larger than `MAX_TRACKABLE_GAP` is a stream
+                    // discontinuity or a massive loss burst, not a normal
+                    // few-packet drop — NACK recovery is futile at that scale
+                    // (finite sender retransmit buffer; the reorder hold
+                    // expires first). The previous code tracked the OLDEST
+                    // 1000 of such a gap (the *least* recoverable end) and
+                    // silently dropped everything beyond — flooding NACKs AND
+                    // losing the tail. Instead resync past it: the reorder
+                    // buffer ages the missing range out as `Lost`, so loss
+                    // accounting stays correct without a NACK storm.
+                    const MAX_TRACKABLE_GAP: u16 = 1000;
+                    let gap = diff as u16;
+                    if gap <= MAX_TRACKABLE_GAP {
+                        for i in 0..gap {
+                            let missing = expected.wrapping_add(i);
+                            let idx = missing as usize & (self.capacity - 1);
+                            let slot = &mut self.slots[idx];
+                            // Only create if this slot isn't already tracking this seq
+                            if !slot.active || slot.seq != missing {
+                                *slot = NackSlot {
+                                    seq: missing,
+                                    active: true,
+                                    next_nack_at: now + self.base_delay,
+                                    nack_count: 0,
+                                };
+                                self.active_count += 1;
+                                new_gaps.push(missing);
+                            }
                         }
                     }
                     self.expected_seq = Some(seq.wrapping_add(1));
@@ -325,6 +339,23 @@ mod tests {
         let nacks = sched.get_pending_nacks(even_later, None);
         assert!(nacks.is_empty());
         assert_eq!(sched.pending_count(), 0);
+    }
+
+    /// A forward jump larger than MAX_TRACKABLE_GAP (1000) is a stream
+    /// discontinuity / massive burst, not recoverable loss: resync past it
+    /// without enqueuing any NACKs. (The old code tracked the oldest 1000 —
+    /// the least-recoverable end — and silently dropped the rest.)
+    #[test]
+    fn huge_gap_resyncs_without_nack_flood() {
+        let mut sched = NackScheduler::new(5, Duration::from_millis(20));
+        let now = Instant::now();
+        sched.on_packet_received(100, now);
+        let gaps = sched.on_packet_received(5100, now); // +5000 jump
+        assert!(gaps.is_empty(), "huge gap must not enqueue NACKs, got {}", gaps.len());
+        assert_eq!(sched.pending_count(), 0, "no pending NACKs after discontinuity resync");
+        // A normal small gap right after still tracks (expected resynced to 5101).
+        let gaps = sched.on_packet_received(5103, now);
+        assert_eq!(gaps.len(), 2, "5101,5102 should be tracked after resync");
     }
 
     #[test]

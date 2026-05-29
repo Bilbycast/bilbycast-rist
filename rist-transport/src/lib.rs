@@ -18,5 +18,6 @@ pub mod dtls_channel;
 pub mod tunnel_task;
 
 pub use config::RistSocketConfig;
+pub use receiver::RistDelivered;
 pub use socket::RistSocket;
 pub use stats::{RistConnStats, RistConnStatsSnapshot, RistRole};
