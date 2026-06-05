@@ -51,7 +51,7 @@ Receiver UDP → receiver task parses RTP, detects gaps
 
 ```bash
 cargo build          # Build both crates
-cargo test           # Run all tests (48 unit tests in rist-protocol)
+cargo test           # Run all tests (63 unit tests in rist-protocol)
 cargo build --release
 ```
 

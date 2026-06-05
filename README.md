@@ -78,7 +78,7 @@ ristsender -i "udp://0.0.0.0:5000" -o "rist://127.0.0.1:6000?buffer=1000" -p 0
 ```bash
 cargo build            # debug
 cargo build --release  # optimised
-cargo test             # 51 unit tests
+cargo test             # 63 unit tests
 ```
 
 No C compiler, CMake, or system libraries required.
