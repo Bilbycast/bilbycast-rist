@@ -112,7 +112,7 @@ RTT Echo Response compound: `[RR(empty), RTT_echo_response]`
 O(1) gap detection using a flat ring buffer indexed by `seq % 4096`.
 
 1. **Gap detection**: When packet N arrives and expected was M (M < N), mark M..N-1 as missing
-2. **NACK timing**: First NACK after `base_delay` (50 ms). Subsequent retries at `RTT` intervals if RTT is known
+2. **NACK timing**: First NACK after `base_delay` (20 ms). Subsequent retries at `RTT` intervals if RTT is known
 3. **Max retries**: After `max_nack_retries` (default 10) attempts, give up on the packet
 4. **Recovery**: When an out-of-order or retransmitted packet arrives, deactivate its NACK slot
 
@@ -162,8 +162,8 @@ Both sender and receiver bind dual-port channels. The port must be even; odd por
 
 Sockets are created with:
 - `SO_REUSEADDR` -- allows quick restart after crash
-- 2 MB receive buffer -- prevents kernel drops at high bitrates
-- 2 MB send buffer -- prevents send blocking during retransmit bursts
+- 32 MB receive buffer -- prevents kernel drops at high bitrates
+- 32 MB send buffer -- prevents send blocking during retransmit bursts
 - Non-blocking mode -- for tokio async I/O
 
 ## Lock-Free Design

@@ -80,7 +80,7 @@ async fn run_receiver() -> anyhow::Result<()> {
 - Binds to even port P (RTP) and P+1 (RTCP)
 - Learns the sender's address from the first received RTP packet
 - Detects gaps in the sequence number stream
-- Sends NACKs after a 50 ms delay (or RTT/2 if RTT is known)
+- Sends NACKs after RTT/2 (or a 20 ms floor when RTT is unknown or smaller)
 - Retries up to `max_nack_retries` times per lost packet
 - RTCP (RR + SDES + NACKs) emitted every 100 ms
 - The internal delivery channel has capacity 1024; slow consumers cause packet drops (logged as warnings)

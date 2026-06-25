@@ -126,7 +126,7 @@ RIST Simple Profile requires an RTCP handshake before data flows. The RTCP peer 
 
 ### Packet loss at very high rates
 
-Increase the UDP receive buffer. bilbycast-rist uses 2 MB buffers by default. For rates above 100 Mbps, you may need to increase the OS-level maximum:
+Increase the UDP receive buffer. bilbycast-rist uses 32 MB buffers by default. For rates above 100 Mbps, you may need to increase the OS-level maximum:
 
 ```bash
 # macOS
