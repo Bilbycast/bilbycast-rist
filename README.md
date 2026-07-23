@@ -126,7 +126,7 @@ Tested against librist 0.2.11 (Simple Profile, `-p 0`):
 | NTP-aligned RTP timestamps | Done |
 | SMPTE 2022-7 bonding | Done |
 | Async sender/receiver (tokio) | Done |
-| Dual-port UDP channel (SO_REUSEADDR, 2 MB buffers) | Done |
+| Dual-port UDP channel (SO_REUSEADDR, 32 MB buffers) | Done |
 | librist 0.2.11 interop (Simple Profile) | Done |
 | GRE-over-UDP tunnelling (Main Profile) | Stubbed |
 | PSK encryption (AES-CTR) | Stubbed |
