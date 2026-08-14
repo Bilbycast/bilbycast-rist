@@ -6,6 +6,7 @@
 pub mod bonding_task;
 pub mod channel;
 pub mod config;
+pub mod guard;
 pub mod listener;
 pub mod receiver;
 pub mod sender;

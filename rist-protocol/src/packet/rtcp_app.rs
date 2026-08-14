@@ -32,6 +32,29 @@ pub const RTT_ECHO_RESPONSE: u8 = 3;
 /// ASCII name field for RIST APP packets.
 const RIST_APP_NAME: [u8; 4] = *b"RIST";
 
+/// Hard ceiling on the number of `(start, extra)` range entries kept from one
+/// APP Range NACK. Entries past this are discarded, not rejected — a lenient
+/// parse is what keeps librist extensions from tearing a compound down.
+///
+/// **Why 512 cannot reject a NACK librist legitimately sends.** Two
+/// independent ceilings sit below it:
+///
+/// 1. librist 0.2.11 caps itself at **200 entries per NACK packet**. Its
+///    writer logs `"nack max counter per packet (%d) exceeded. Skipping the
+///    rest"` with the literal `200` (verified in the shipped
+///    `librist.so.4.4.0` — the log call site loads `$0xc8` into the vararg
+///    register feeding that `%d`).
+/// 2. A RIST RTCP datagram is read into a 2048-byte buffer
+///    (`rist_transport::receiver::MAX_UDP_RECV`, and the sender's own RTCP
+///    buffer). After the 4-byte common header + SSRC + `"RIST"` name, at most
+///    `(2048 - 12) / 4 = 509` entries can physically arrive in one datagram.
+///
+/// So 512 is above both the peer's self-imposed limit and the wire's physical
+/// limit: no NACK that can reach this parser intact is ever truncated. What it
+/// does bound is a hostile caller handing `parse` a large buffer — the entry
+/// `Vec` is then capped instead of scaling with the input.
+pub const MAX_RANGE_NACK_ENTRIES: usize = 512;
+
 /// RTT Echo Request packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RttEchoRequest {
@@ -129,9 +152,12 @@ impl RistApp {
         match subtype {
             RIST_APP_RANGE_NACK => {
                 // librist Range NACK: after SSRC(4) + "RIST"(4), the rest is
-                // an array of (u16 start, u16 extra) entries. Parse all.
-                let mut entries = Vec::with_capacity(r.remaining() / 4);
-                while r.remaining() >= 4 {
+                // an array of (u16 start, u16 extra) entries, capped at
+                // MAX_RANGE_NACK_ENTRIES (see the constant for why that
+                // ceiling is unreachable for real librist traffic).
+                let mut entries =
+                    Vec::with_capacity((r.remaining() / 4).min(MAX_RANGE_NACK_ENTRIES));
+                while r.remaining() >= 4 && entries.len() < MAX_RANGE_NACK_ENTRIES {
                     let start = r.get_u16();
                     let extra = r.get_u16();
                     entries.push((start, extra));
@@ -257,6 +283,56 @@ mod tests {
         let subtype = bytes[0] & 0x1F;
         let parsed = RistApp::parse(&bytes[4..], subtype).unwrap();
         assert_eq!(parsed, req);
+    }
+
+    /// A 2048-byte RTCP datagram can carry 509 Range NACK entries, and each
+    /// entry can name a 65 536-seq run — the sender expands every one of them
+    /// into retransmit work. The parsed entry array must therefore be capped
+    /// rather than scaling with whatever the peer declared.
+    ///
+    /// The cap sits above both librist's own 200-entries-per-packet limit and
+    /// the 509 that physically fit in a datagram, so this can only bind on a
+    /// buffer no real peer can deliver.
+    #[test]
+    fn range_nack_entry_array_is_capped() {
+        // Body: SSRC(4) + "RIST"(4) + 4 bytes per entry.
+        let over = MAX_RANGE_NACK_ENTRIES + 250;
+        let mut body = Vec::with_capacity(8 + 4 * over);
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(b"RIST");
+        for _ in 0..over {
+            body.extend_from_slice(&[0x00, 0x00, 0xFF, 0xFF]);
+        }
+
+        match RistApp::parse(&body, RIST_APP_RANGE_NACK).unwrap() {
+            RistApp::RangeNack(n) => {
+                assert_eq!(n.entries.len(), MAX_RANGE_NACK_ENTRIES);
+                assert_eq!(n.entries[0], (0, 0xFFFF));
+            }
+            other => panic!("expected RangeNack, got {other:?}"),
+        }
+    }
+
+    /// The cap must not touch a NACK that fits the wire: 509 entries is the
+    /// most a 2048-byte RTCP datagram can hold, and librist itself stops at
+    /// 200, so both must round-trip whole.
+    #[test]
+    fn range_nack_keeps_every_entry_a_real_peer_can_send() {
+        for count in [200usize, 509] {
+            let entries: Vec<(u16, u16)> =
+                (0..count).map(|i| (i as u16, (i % 7) as u16)).collect();
+            let nack = RistApp::RangeNack(RangeNack {
+                media_ssrc: 0x1234_5678,
+                entries: entries.clone(),
+            });
+            let bytes = nack.serialize();
+            assert!(bytes.len() <= 2048, "{count} entries must fit a datagram");
+            let parsed = RistApp::parse(&bytes[4..], bytes[0] & 0x1F).unwrap();
+            match parsed {
+                RistApp::RangeNack(n) => assert_eq!(n.entries, entries),
+                other => panic!("expected RangeNack, got {other:?}"),
+            }
+        }
     }
 
     #[test]

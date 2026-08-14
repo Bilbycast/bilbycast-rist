@@ -30,10 +30,63 @@ use rist_protocol::protocol::rtcp_state::RtcpSenderState;
 use rist_protocol::protocol::rtt::RttEstimator;
 
 use crate::config::RistSocketConfig;
+use crate::guard::{NackWorkBudget, nack_targets_us, peer_move_allowed};
 use crate::stats::RistConnStats;
 
 /// Maximum RTP packet size (header + payload).
 const MAX_RTP_PACKET: usize = 1500;
+
+/// Retransmit every sequence number `seqs` yields, charging the datagram-wide
+/// work budget as it goes. Returns `true` if the budget ran out, which is the
+/// caller's signal to abandon the rest of the datagram — the budget is shared
+/// by every sub-packet in the compound, so a spent budget means the datagram is
+/// finished, not just this sub-packet.
+///
+/// The iterator is walked lazily and nothing is collected: a `Range` NACK entry
+/// names up to 65 536 sequence numbers, so materialising the expansion first
+/// was an allocation sized straight off the wire.
+///
+/// Each retransmit flips the SSRC LSB to 1 so librist's receiver (which uses
+/// `flow_id & 1` as the retry flag — see libRIST `rist-common.c`) counts these
+/// as retransmits rather than fresh data. The buffered packet has LSB=0; we
+/// copy into the caller's reusable `retx_buf` and flip byte 11 (low byte of the
+/// SSRC u32 in big-endian wire order). Zero allocations on the hot path.
+#[allow(clippy::too_many_arguments)]
+async fn serve_nack_entries<I: Iterator<Item = u16>>(
+    seqs: I,
+    retransmit_buf: &RetransmitBuffer,
+    retx_buf: &mut BytesMut,
+    rtp_socket: &UdpSocket,
+    remote_rtp_addr: SocketAddr,
+    budget: &mut NackWorkBudget,
+    requested: &mut u64,
+    retransmitted: &mut u64,
+) -> bool {
+    for lost_seq in seqs {
+        if !budget.charge_scan() {
+            return true;
+        }
+        *requested += 1;
+        // A miss costs one ring index and nothing else — only the scan
+        // budget was charged, so stale requests at the edge of the peer's
+        // window cannot starve the ones that hit.
+        let Some(pkt_data) = retransmit_buf.get(lost_seq) else {
+            continue;
+        };
+        if !budget.charge_retx() {
+            return true;
+        }
+        retx_buf.clear();
+        retx_buf.extend_from_slice(pkt_data);
+        if retx_buf.len() > 11 {
+            retx_buf[11] |= 0x01;
+        }
+        if rtp_socket.send_to(retx_buf, remote_rtp_addr).await.is_ok() {
+            *retransmitted += 1;
+        }
+    }
+    false
+}
 
 /// Handle for sending data to a RIST sender task.
 pub struct SenderHandle {
@@ -102,8 +155,15 @@ async fn sender_loop(
     let mut retx_buf = BytesMut::with_capacity(MAX_RTP_PACKET);
     let mut rtcp_recv_buf = vec![0u8; 2048];
 
+    // The RTCP peer starts at the address derived from the operator-configured
+    // RTP destination and is held there once it goes live — see `guard` for the
+    // hold-down rules and the residual risk an unauthenticated profile leaves.
     let mut remote_rtcp_addr = crate::channel::RistChannel::rtcp_addr_for(remote_rtp_addr);
+    let mut rtcp_peer_live: Option<Instant> = None;
     let mut rtcp_interval = tokio::time::interval(config.rtcp_interval);
+
+    // Sized once: the retransmit ring's capacity is fixed for the session.
+    let nack_budget_template = NackWorkBudget::for_capacity(retransmit_buf.capacity());
 
     loop {
         tokio::select! {
@@ -153,11 +213,6 @@ async fn sender_loop(
             result = rtcp_socket.recv_from(&mut rtcp_recv_buf) => {
                 let (len, from) = result?;
                 let recv_at = Instant::now();
-                // Learn receiver's actual RTCP address from first incoming packet
-                if from != remote_rtcp_addr {
-                    log::info!("RIST sender: learned receiver RTCP address {from} (was {remote_rtcp_addr})");
-                    remote_rtcp_addr = from;
-                }
                 // Trace: dump the first 64 bytes of every RTCP packet we
                 // receive until we know the peer NACK format. Remove once
                 // interop is proven. Gated at `trace` so it's silent by
@@ -167,127 +222,168 @@ async fn sender_loop(
                     len,
                     &rtcp_recv_buf[..len.min(256)]
                 );
-                if let Ok(compound) = RtcpCompound::parse(&rtcp_recv_buf[..len]) {
-                    log::trace!(
-                        "RIST sender: RTCP compound parsed, {} sub-packets",
-                        compound.packets.len()
+                // The peer slot moves only under the hold-down rules, and only
+                // on a datagram that actually decoded as RTCP — adopting on the
+                // raw source address (the old behaviour) let one unauthenticated
+                // datagram of any content permanently redirect our SR / SDES /
+                // RTT-echo feedback away from the real receiver.
+                let Ok(compound) = RtcpCompound::parse(&rtcp_recv_buf[..len]) else {
+                    log::debug!("RIST sender: undecodable RTCP from {from} ({len} bytes)");
+                    continue;
+                };
+                if compound.packets.is_empty() {
+                    continue;
+                }
+                if !peer_move_allowed(from, remote_rtcp_addr, rtcp_peer_live, recv_at) {
+                    // No warn!: this is attacker-reachable at line rate, and a
+                    // log line per datagram is its own amplification.
+                    log::debug!(
+                        "RIST sender: ignoring RTCP from {from}; peer {remote_rtcp_addr} is live"
                     );
-                    for pkt in &compound.packets {
-                        log::trace!("RIST sender: RTCP sub-packet: {:?}", pkt);
-                        match pkt {
-                            RtcpPacket::Nack(nack) => {
-                                // Retransmit requested packets — iterate without allocating.
-                                //
-                                // Each retransmit must flip the SSRC LSB to 1 so librist's
-                                // receiver (which uses `flow_id & 1` as the retry flag — see
-                                // libRIST `rist-common.c`) counts these as retransmits rather
-                                // than fresh data. The buffered packet has LSB=0; we copy into
-                                // `retx_buf` once and flip byte 11 (low byte of the SSRC u32
-                                // in big-endian wire order) for each send. Zero allocations
-                                // on the hot path thanks to `retx_buf` re-use.
-                                // Cap retransmits served per NACK so a huge
-                                // loss-burst NACK can't block this select! task
-                                // (which also sends fresh media) on hundreds of
-                                // awaited send_to calls — that would starve the
-                                // live stream during recovery. Excess seqs are
-                                // still counted as `requested`; the receiver
-                                // re-NACKs any still-missing ones next round.
-                                const MAX_RETX_PER_NACK: u64 = 512;
-                                let mut requested: u64 = 0;
-                                let mut retransmitted: u64 = 0;
-                                let mut served: u64 = 0;
-                                let seqs: Vec<u16> = match &nack.entries {
-                                    rist_protocol::packet::rtcp_nack::NackEntries::Bitmask(v) => {
-                                        v.iter().flat_map(|e| e.lost_seqs()).collect()
-                                    }
-                                    rist_protocol::packet::rtcp_nack::NackEntries::Range(v) => {
-                                        v.iter().flat_map(|e| e.lost_seqs()).collect()
-                                    }
-                                };
-                                for lost_seq in seqs {
-                                    requested += 1;
-                                    if served >= MAX_RETX_PER_NACK {
-                                        continue;
-                                    }
-                                    if let Some(pkt_data) = retransmit_buf.get(lost_seq) {
-                                        retx_buf.clear();
-                                        retx_buf.extend_from_slice(pkt_data);
-                                        if retx_buf.len() > 11 {
-                                            retx_buf[11] |= 0x01;
-                                        }
-                                        served += 1;
-                                        if rtp_socket.send_to(&retx_buf, remote_rtp_addr).await.is_ok() {
-                                            retransmitted += 1;
-                                        }
-                                    }
-                                }
-                                stats.nacks_received.fetch_add(requested, Ordering::Relaxed);
-                                stats.packets_retransmitted.fetch_add(retransmitted, Ordering::Relaxed);
-                            }
-                            RtcpPacket::App(RistApp::RttEchoRequest(req)) => {
-                                // Report our actual receive→respond turnaround so
-                                // the requester can subtract it from the measured
-                                // RTT (was hard-coded 0, biasing SRT/NACK-retry high).
-                                let response = RistApp::RttEchoResponse(
-                                    rist_protocol::packet::rtcp_app::RttEchoResponse {
-                                        ssrc: req.ssrc,
-                                        timestamp_msw: req.timestamp_msw,
-                                        timestamp_lsw: req.timestamp_lsw,
-                                        processing_delay_us: recv_at.elapsed().as_micros().min(u32::MAX as u128) as u32,
-                                    },
+                    continue;
+                }
+                if from != remote_rtcp_addr {
+                    if from.ip() == remote_rtcp_addr.ip() {
+                        // A NAT port rebind is always allowed and therefore
+                        // NOT rate-limited — so it must not log at info, or a
+                        // spoofer varying its source port gets a log line per
+                        // datagram out of us.
+                        log::debug!("RIST sender: receiver RTCP port moved to {from}");
+                    } else {
+                        // Rate-limited by construction: a different-IP move
+                        // needs PEER_TAKEOVER_GRACE of silence from the
+                        // incumbent first.
+                        log::info!("RIST sender: learned receiver RTCP address {from} (was {remote_rtcp_addr})");
+                    }
+                    remote_rtcp_addr = from;
+                }
+                rtcp_peer_live = Some(recv_at);
+                // One work budget for the WHOLE datagram, shared by every NACK
+                // sub-packet in it. A per-sub-packet cap is not a bound: 128
+                // minimal APP Range NACKs fit in this 2048-byte buffer, each
+                // with fresh counters.
+                let mut budget = nack_budget_template;
+                log::trace!(
+                    "RIST sender: RTCP compound parsed, {} sub-packets",
+                    compound.packets.len()
+                );
+                for pkt in &compound.packets {
+                    log::trace!("RIST sender: RTCP sub-packet: {:?}", pkt);
+                    match pkt {
+                        RtcpPacket::Nack(nack) => {
+                            // RFC 4585 names the media source explicitly; a
+                            // NACK for someone else's SSRC is not ours to
+                            // answer.
+                            if !nack_targets_us(nack.media_ssrc, ssrc) {
+                                log::debug!(
+                                    "RIST sender: NACK for foreign media SSRC {:#010x}, ignoring",
+                                    nack.media_ssrc
                                 );
-                                // RFC 3550 Section 6.1: compound RTCP must start with SR or RR
-                                let compound = RtcpCompound {
-                                    packets: vec![
-                                        RtcpPacket::ReceiverReport(ReceiverReport::empty(ssrc)),
-                                        RtcpPacket::App(response),
-                                    ],
-                                };
-                                let bytes = compound.serialize();
-                                let _ = rtcp_socket.send_to(&bytes, from).await;
+                                continue;
                             }
-                            RtcpPacket::App(RistApp::RttEchoResponse(resp)) => {
-                                rtt_estimator.on_response(
-                                    Instant::now(),
-                                    resp.timestamp_msw,
-                                    resp.timestamp_lsw,
-                                    resp.processing_delay_us,
-                                );
-                                if let Some(rtt) = rtt_estimator.srtt() {
-                                    stats.rtt_us.store(
-                                        rtt.as_micros() as u64,
-                                        Ordering::Relaxed,
-                                    );
+                            // Iterate lazily: `Range` entries carry a
+                            // 16-bit run length, so collecting the expanded
+                            // sequence list first was an unbounded
+                            // allocation driven straight off the wire
+                            // (509 entries x 65 536 seqs = a 66 MB Vec).
+                            let mut requested: u64 = 0;
+                            let mut retransmitted: u64 = 0;
+                            let spent = match &nack.entries {
+                                rist_protocol::packet::rtcp_nack::NackEntries::Bitmask(v) => {
+                                    serve_nack_entries(
+                                        v.iter().flat_map(|e| e.lost_seqs()),
+                                        &retransmit_buf, &mut retx_buf, &rtp_socket,
+                                        remote_rtp_addr, &mut budget,
+                                        &mut requested, &mut retransmitted,
+                                    ).await
                                 }
-                            }
-                            RtcpPacket::App(RistApp::RangeNack(nack)) => {
-                                // librist's default NACK format (PT=204 APP
-                                // "RIST" subtype 0). Each entry covers a run
-                                // of seqs: `start` and `extra` more after it.
-                                let mut requested: u64 = 0;
-                                let mut retransmitted: u64 = 0;
-                                for (start, extra) in &nack.entries {
-                                    let count = (*extra as u32) + 1;
-                                    for i in 0..count {
-                                        let lost_seq = start.wrapping_add(i as u16);
-                                        requested += 1;
-                                        if let Some(pkt_data) = retransmit_buf.get(lost_seq) {
-                                            retx_buf.clear();
-                                            retx_buf.extend_from_slice(pkt_data);
-                                            if retx_buf.len() > 11 {
-                                                retx_buf[11] |= 0x01;
-                                            }
-                                            if rtp_socket.send_to(&retx_buf, remote_rtp_addr).await.is_ok() {
-                                                retransmitted += 1;
-                                            }
-                                        }
-                                    }
+                                rist_protocol::packet::rtcp_nack::NackEntries::Range(v) => {
+                                    serve_nack_entries(
+                                        v.iter().flat_map(|e| e.lost_seqs()),
+                                        &retransmit_buf, &mut retx_buf, &rtp_socket,
+                                        remote_rtp_addr, &mut budget,
+                                        &mut requested, &mut retransmitted,
+                                    ).await
                                 }
-                                stats.nacks_received.fetch_add(requested, Ordering::Relaxed);
-                                stats.packets_retransmitted.fetch_add(retransmitted, Ordering::Relaxed);
+                            };
+                            stats.nacks_received.fetch_add(requested, Ordering::Relaxed);
+                            stats.packets_retransmitted.fetch_add(retransmitted, Ordering::Relaxed);
+                            if spent {
+                                // Budget gone: the rest of this datagram is
+                                // not serviced. Anything genuinely still
+                                // missing is re-NACKed next round.
+                                break;
                             }
-                            _ => {}
                         }
+                        RtcpPacket::App(RistApp::RttEchoRequest(req)) => {
+                            // Report our actual receive→respond turnaround so
+                            // the requester can subtract it from the measured
+                            // RTT (was hard-coded 0, biasing SRT/NACK-retry high).
+                            let response = RistApp::RttEchoResponse(
+                                rist_protocol::packet::rtcp_app::RttEchoResponse {
+                                    ssrc: req.ssrc,
+                                    timestamp_msw: req.timestamp_msw,
+                                    timestamp_lsw: req.timestamp_lsw,
+                                    processing_delay_us: recv_at.elapsed().as_micros().min(u32::MAX as u128) as u32,
+                                },
+                            );
+                            // RFC 3550 Section 6.1: compound RTCP must start with SR or RR
+                            let compound = RtcpCompound {
+                                packets: vec![
+                                    RtcpPacket::ReceiverReport(ReceiverReport::empty(ssrc)),
+                                    RtcpPacket::App(response),
+                                ],
+                            };
+                            let bytes = compound.serialize();
+                            let _ = rtcp_socket.send_to(&bytes, from).await;
+                        }
+                        RtcpPacket::App(RistApp::RttEchoResponse(resp)) => {
+                            rtt_estimator.on_response(
+                                Instant::now(),
+                                resp.timestamp_msw,
+                                resp.timestamp_lsw,
+                                resp.processing_delay_us,
+                            );
+                            if let Some(rtt) = rtt_estimator.srtt() {
+                                stats.rtt_us.store(
+                                    rtt.as_micros() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        }
+                        RtcpPacket::App(RistApp::RangeNack(nack)) => {
+                            // librist's default NACK format (PT=204 APP
+                            // "RIST" subtype 0). Each entry covers a run
+                            // of seqs: `start` and `extra` more after it —
+                            // up to 65 536 per entry, which is why this arm
+                            // needs the same budget the RTPFB arm gets.
+                            // Until now it had none at all.
+                            if !nack_targets_us(nack.media_ssrc, ssrc) {
+                                log::debug!(
+                                    "RIST sender: APP NACK for foreign flow {:#010x}, ignoring",
+                                    nack.media_ssrc
+                                );
+                                continue;
+                            }
+                            let mut requested: u64 = 0;
+                            let mut retransmitted: u64 = 0;
+                            let seqs = nack.entries.iter().flat_map(|(start, extra)| {
+                                let start = *start;
+                                (0..=(*extra as u32)).map(move |i| start.wrapping_add(i as u16))
+                            });
+                            let spent = serve_nack_entries(
+                                seqs,
+                                &retransmit_buf, &mut retx_buf, &rtp_socket,
+                                remote_rtp_addr, &mut budget,
+                                &mut requested, &mut retransmitted,
+                            ).await;
+                            stats.nacks_received.fetch_add(requested, Ordering::Relaxed);
+                            stats.packets_retransmitted.fetch_add(retransmitted, Ordering::Relaxed);
+                            if spent {
+                                break;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

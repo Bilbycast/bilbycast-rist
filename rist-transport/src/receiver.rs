@@ -42,6 +42,7 @@ use rist_protocol::protocol::rtcp_state::RtcpReceiverState;
 use rist_protocol::protocol::rtt::RttEstimator;
 
 use crate::config::RistSocketConfig;
+use crate::guard::source_allowed;
 use crate::stats::RistConnStats;
 
 /// Maximum UDP datagram size we'll receive.
@@ -56,6 +57,14 @@ const MIN_NACK_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// A parsed RTP media packet awaiting batch insert into the reorder buffer.
 struct ParsedRtp {
     seq: u16,
+    /// The media sender's SSRC, straight off the RTP header.
+    ///
+    /// Carried so our NACKs can NAME the sender rather than falling back to
+    /// 0. The sender's NACK guard identifies a NACK as "for me" by comparing
+    /// `media_ssrc`; a NACK naming 0 is indistinguishable from one a blind
+    /// off-path attacker can forge without ever observing the stream, so
+    /// naming the real value is what makes that check mean anything.
+    ssrc: u32,
     rtp_ts: u32,
     payload: Bytes,
     arrival_us: u64,
@@ -70,6 +79,7 @@ fn parse_rtp(buf: &[u8], epoch: Instant) -> Option<ParsedRtp> {
     let (header, header_size) = RtpHeader::parse(buf).ok()?;
     Some(ParsedRtp {
         seq: header.sequence_number,
+        ssrc: header.ssrc,
         rtp_ts: header.timestamp,
         payload: Bytes::copy_from_slice(&buf[header_size..]),
         arrival_us: Instant::now().duration_since(epoch).as_micros() as u64,
@@ -221,6 +231,10 @@ async fn receiver_loop(
     let mut rtcp_state = RtcpReceiverState::new(ssrc, cname, config.rtcp_interval);
     let mut nack_scheduler = NackScheduler::new(config.max_nack_retries, MIN_NACK_RETRY_DELAY);
     let mut rtt_estimator = RttEstimator::new(config.rtcp_interval * 10);
+    // SSRC observed on inbound RTP headers, latched on the first media
+    // packet. Available long before the first RTCP SR, so our NACKs can name
+    // the sender from the start rather than sending 0.
+    let mut observed_media_ssrc: Option<u32> = None;
 
     // Shared reorder buffer + the dedicated delivery thread.
     let shared = Arc::new(DrainShared {
@@ -241,7 +255,17 @@ async fn receiver_loop(
     let mut rtp_buf = vec![0u8; MAX_UDP_RECV];
     let mut rtcp_recv_buf = vec![0u8; MAX_UDP_RECV];
 
+    // Source admission. RIST Simple Profile has no authentication, so the media
+    // source is whoever we latch — but a latched source that is still live does
+    // not move to a different IP. `remote_addr`, documented as the receiver's
+    // "optional sender filter" and until now never read, pins the accepted
+    // source IP outright when an operator configured one. See `crate::guard`
+    // for the rules and the residual risk.
+    let pinned_source_ip = config.remote_addr.map(|a| a.ip());
+    let mut sender_rtp_addr: Option<SocketAddr> = None;
+    let mut rtp_peer_live: Option<Instant> = None;
     let mut sender_rtcp_addr: Option<SocketAddr> = None;
+    let mut rtcp_peer_live: Option<Instant> = None;
     let mut rtcp_interval = tokio::time::interval(config.rtcp_interval);
     // Fast pump for NACK emission (delivery is the drain thread's job now).
     let mut pump_interval = tokio::time::interval(NACK_PUMP_INTERVAL);
@@ -274,21 +298,63 @@ async fn receiver_loop(
             result = rtp_socket.recv_from(&mut rtp_buf) => {
                 match result {
                     Ok((len, from)) => {
-                        if sender_rtcp_addr.is_none() {
+                        let arrived_at = Instant::now();
+                        // Admission first: an un-admitted source must not reach
+                        // the reorder buffer at all. Injecting media used to be
+                        // enough to move the sequence window, corrupt the gap
+                        // state and drive NACKs — the first datagram to arrive
+                        // owned the session for its whole life.
+                        if !source_allowed(from, pinned_source_ip, sender_rtp_addr, rtp_peer_live, arrived_at) {
+                            // debug, never warn: attacker-reachable at line rate.
+                            log::debug!("RIST receiver: RTP from {from} rejected; session is live");
+                            continue;
+                        }
+                        if sender_rtp_addr != Some(from) {
+                            match sender_rtp_addr {
+                                None => log::info!("RIST receiver: sender detected at {from}"),
+                                // Different IP: hold-down-limited to once per
+                                // PEER_TAKEOVER_GRACE, so info is safe here.
+                                Some(prev) if prev.ip() != from.ip() => log::info!(
+                                    "RIST receiver: media source moved to {from} (was {prev})"
+                                ),
+                                // Same IP, new port: always allowed and so
+                                // never rate-limited — must stay at debug.
+                                Some(_) => log::debug!("RIST receiver: media source port moved to {from}"),
+                            }
+                            sender_rtp_addr = Some(from);
+                            // Track the control peer alongside the media peer;
+                            // they are the same host's socket pair.
                             sender_rtcp_addr = Some(crate::channel::RistChannel::rtcp_addr_for(from));
-                            log::info!("RIST receiver: sender detected at {from}");
                         }
 
                         const MAX_BATCH: usize = 32;
                         let mut batch: Vec<ParsedRtp> = Vec::with_capacity(MAX_BATCH);
                         if let Some(p) = parse_rtp(&rtp_buf[..len], epoch) {
+                            if observed_media_ssrc.is_none() {
+                                observed_media_ssrc = Some(p.ssrc);
+                            }
                             batch.push(p);
                         } else {
                             log::debug!("RTP parse error, len={len}");
                         }
-                        while batch.len() < MAX_BATCH {
+                        // Bound the drain on datagrams READ, not on datagrams
+                        // kept: a rejected one must still cost an iteration, or
+                        // a flood from a foreign source spins this loop forever
+                        // while `batch` never grows.
+                        let mut drained = 1usize;
+                        while batch.len() < MAX_BATCH && drained < MAX_BATCH {
                             match rtp_socket.try_recv_from(&mut rtp_buf) {
-                                Ok((l, _)) => {
+                                Ok((l, src)) => {
+                                    drained += 1;
+                                    // Every datagram in the burst is admitted on
+                                    // its own source — the batch drain used to
+                                    // discard the address entirely, so one
+                                    // admitted packet carried up to 31 unchecked
+                                    // ones in behind it.
+                                    if src != from {
+                                        log::debug!("RIST receiver: RTP burst datagram from {src} rejected");
+                                        continue;
+                                    }
                                     if let Some(p) = parse_rtp(&rtp_buf[..l], epoch) {
                                         batch.push(p);
                                     }
@@ -299,6 +365,7 @@ async fn receiver_loop(
 
                         if !batch.is_empty() {
                             let now = Instant::now();
+                            rtp_peer_live = Some(now);
                             // One lock for the whole burst; `now` is the true
                             // UDP-arrival anchor carried through to delivery.
                             let mut outcomes: Vec<InsertOutcome> =
@@ -356,12 +423,29 @@ async fn receiver_loop(
                     Ok((len, from)) => {
                         let now = Instant::now();
 
-                        if sender_rtcp_addr.is_none() {
-                            sender_rtcp_addr = Some(from);
+                        // The control peer is held by the same rules as the
+                        // media peer, and media liveness protects it too: once
+                        // RTP is flowing from a host, its control slot is not
+                        // handed to a different IP. Without this, a stranger's
+                        // RTT Echo Request made us emit a reply to any source,
+                        // and the SR it carried steered our RTCP.
+                        let live = rtcp_peer_live.max(rtp_peer_live);
+                        if !source_allowed(from, pinned_source_ip, sender_rtcp_addr, live, now) {
+                            log::debug!("RIST receiver: RTCP from {from} rejected; session is live");
+                            continue;
                         }
 
                         match RtcpCompound::parse(&rtcp_recv_buf[..len]) {
                             Ok(compound) => {
+                                if compound.packets.is_empty() {
+                                    continue;
+                                }
+                                // Latch only on a datagram that actually
+                                // decoded as RTCP.
+                                if sender_rtcp_addr != Some(from) {
+                                    sender_rtcp_addr = Some(from);
+                                }
+                                rtcp_peer_live = Some(now);
                                 for pkt in &compound.packets {
                                     match pkt {
                                         RtcpPacket::SenderReport(sr) => {
@@ -428,7 +512,16 @@ async fn receiver_loop(
                     let rtt = rtt_estimator.srtt();
                     let pending_nacks = nack_scheduler.get_pending_nacks(now, rtt);
                     if !pending_nacks.is_empty() {
-                        let sender_ssrc = rtcp_state.sender_ssrc.unwrap_or(0);
+                        // Prefer the SSRC learned from the RTCP SR; fall
+                        // back to the one observed on the RTP headers, which
+                        // is available from the first media packet — long
+                        // before the first SR. The final `unwrap_or(0)` is now
+                        // only reachable when no media has arrived at all, in
+                        // which case there is nothing to NACK anyway.
+                        let sender_ssrc = rtcp_state
+                            .sender_ssrc
+                            .or(observed_media_ssrc)
+                            .unwrap_or(0);
                         let builder = NackListBuilder::new(ssrc, sender_ssrc);
                         let nack_pkt = builder.build_bitmask(&pending_nacks);
                         let rr = rtcp_state.generate_rr(now);

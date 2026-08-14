@@ -82,6 +82,20 @@ pub enum RtcpPacket {
     },
 }
 
+/// Hard ceiling on how many sub-packets one compound datagram may contribute.
+///
+/// The smallest well-formed RTCP sub-packet is 4 bytes (`length = 0`), so a
+/// 2048-byte datagram can otherwise declare 512 of them — and every one is a
+/// fresh set of NACK counters for the sender to service. Bounding the loop
+/// bounds both the `packets` vector and the downstream per-sub-packet work.
+///
+/// 64 is far above anything a real peer emits: this crate serialises at most
+/// three sub-packets per datagram (RR/SR + SDES + APP or NACK), and librist
+/// 0.2.11's receiver compound is the same order — SR/RR, SDES, its PT=77 XR
+/// extension, an APP echo and one APP Range NACK. Sub-packets past the limit
+/// are dropped rather than erroring, keeping the parse lenient.
+pub const MAX_RTCP_SUB_PACKETS: usize = 64;
+
 /// A compound RTCP packet containing multiple sub-packets.
 #[derive(Debug, Clone)]
 pub struct RtcpCompound {
@@ -94,7 +108,7 @@ impl RtcpCompound {
         let mut packets = Vec::new();
         let mut offset = 0;
 
-        while offset + 4 <= buf.len() {
+        while offset + 4 <= buf.len() && packets.len() < MAX_RTCP_SUB_PACKETS {
             let header = RtcpCommonHeader::parse(&buf[offset..])?;
             let pkt_size = header.packet_size();
             if offset + pkt_size > buf.len() {
@@ -209,6 +223,56 @@ mod tests {
             RtcpPacket::Sdes(sdes) => assert_eq!(sdes.cname, "10.0.0.1"),
             _ => panic!("expected SDES"),
         }
+    }
+
+    /// One datagram must not be able to declare an unbounded number of
+    /// sub-packets. A 16-byte APP "RIST" Range NACK is the smallest carrier of
+    /// a fresh set of retransmit counters, and 128 of them fit in the 2048-byte
+    /// RTCP receive buffer — which is how a per-sub-packet cap alone still let
+    /// one datagram multiply into thousands of retransmits.
+    #[test]
+    fn compound_sub_packet_count_is_bounded() {
+        // 16-byte APP Range NACK: header(4) + SSRC(4) + "RIST"(4) + 1 entry(4).
+        let mut one = Vec::new();
+        one.extend_from_slice(&[0x80, RTCP_PT_APP, 0x00, 0x03]);
+        one.extend_from_slice(&0u32.to_be_bytes());
+        one.extend_from_slice(b"RIST");
+        one.extend_from_slice(&[0x00, 0x00, 0xFF, 0xFF]);
+        assert_eq!(one.len(), 16);
+
+        let mut datagram = Vec::new();
+        while datagram.len() + one.len() <= 2048 {
+            datagram.extend_from_slice(&one);
+        }
+        assert_eq!(datagram.len() / 16, 128, "128 sub-packets fit a datagram");
+
+        let parsed = RtcpCompound::parse(&datagram).unwrap();
+        assert_eq!(parsed.packets.len(), MAX_RTCP_SUB_PACKETS);
+    }
+
+    /// The bound must sit well clear of any compound a real peer emits — this
+    /// crate serialises three, librist's receiver compound is the same order.
+    #[test]
+    fn compound_bound_clears_a_real_receiver_compound() {
+        let compound = RtcpCompound {
+            packets: vec![
+                RtcpPacket::ReceiverReport(ReceiverReport::empty(0x2222_2222)),
+                RtcpPacket::Sdes(Sdes {
+                    ssrc: 0x2222_2222,
+                    cname: "10.0.0.2".to_string(),
+                }),
+                RtcpPacket::Nack(NackPacket {
+                    sender_ssrc: 0x2222_2222,
+                    media_ssrc: 0x1111_1111,
+                    entries: NackEntries::Bitmask(vec![BitmaskNack { pid: 7, blp: 3 }]),
+                }),
+            ],
+        };
+        let bytes = compound.serialize();
+        let parsed = RtcpCompound::parse(&bytes).unwrap().packets.len();
+        assert_eq!(parsed, 3);
+        // ...and the bound leaves an order of magnitude of headroom above it.
+        assert!(MAX_RTCP_SUB_PACKETS >= parsed * 8);
     }
 
     #[test]

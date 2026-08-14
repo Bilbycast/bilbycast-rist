@@ -32,6 +32,7 @@ A standalone Rust library implementing the VSF RIST protocol for reliable media 
 - `channel.rs` — Dual-port UDP binding (RTP on even port P, RTCP on P+1)
 - `sender.rs` — Sender task: RTP out, NACK handling, retransmit from buffer, periodic RTCP SR+SDES
 - `receiver.rs` — Receiver task: RTP in, gap detection, NACK generation, periodic RTCP RR+SDES
+- `guard.rs` — Admission rules for an unauthenticated peer: source hold-down (a live slot does not move to a different source IP), NACK media-SSRC check, and the per-received-datagram NACK work budget
 - `socket.rs` — Public API: `RistSocket::sender()` and `RistSocket::receiver()`
 
 ### Data Flow
@@ -84,6 +85,7 @@ cargo build --release
 | SMPTE 2022-7 bonding | Done (protocol layer) |
 | Async sender/receiver tasks | Done |
 | Dual-port UDP channel | Done |
+| Unauthenticated-peer hardening (`rist_transport::guard`) | Done — per-datagram NACK work budget, NACK media-SSRC check, 12 s source hold-down on both sockets. **Mitigation, not a fix**: Simple Profile has no authentication, so a peer that wins the race before the real one, or arrives during a ≥12 s outage, still takes the slot. Closing that needs Main Profile DTLS/PSK. |
 | Shared stats handle (`RistConnStats`) | Done (Arc<AtomicU64>, lock-free) |
 | GRE-over-UDP tunneling (Main Profile) | Stubbed — separate sprint |
 | Main Profile peer multiplexing | Stubbed — separate sprint |
