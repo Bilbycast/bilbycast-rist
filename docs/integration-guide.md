@@ -78,7 +78,17 @@ async fn run_receiver() -> anyhow::Result<()> {
 ### Receiver behaviour
 
 - Binds to even port P (RTP) and P+1 (RTCP)
-- Learns the sender's address from the first received RTP packet
+- Learns the sender's address from the first received RTP packet — or accepts
+  only `remote_addr`'s IP, if one is configured, which pins the source outright
+- Holds the learned address: once the session is live, RTP or RTCP from a
+  *different* source IP is dropped (at `debug`, never `warn` — it is
+  attacker-reachable at line rate) until 12 s after the last accepted packet
+  (`guard::PEER_TAKEOVER_GRACE`). A same-IP port change — NAT rebinding — is
+  always accepted, and the RTCP slot inherits the RTP slot's liveness so a
+  stranger's RTT Echo Request cannot steer control while media is flowing. A
+  sender that genuinely moves to a new IP is picked up once the incumbent has
+  been quiet for the grace window. Simple Profile has no authentication, so this
+  bounds a takeover rather than preventing one — see `CLAUDE.md`
 - Detects gaps in the sequence number stream
 - Sends NACKs after RTT/2 (or a 20 ms floor when RTT is unknown or smaller)
 - Retries up to `max_nack_retries` times per lost packet
@@ -101,7 +111,12 @@ pub struct RistSocketConfig {
     /// Local address to bind (RTP port, must be even).
     pub local_addr: SocketAddr,
 
-    /// Remote address (for sender: receiver's RTP port).
+    /// Remote address. For a sender: the receiver's RTP port (required).
+    /// For a receiver: an **enforced source-IP pin** — RTP or RTCP from any
+    /// other IP is dropped before it reaches the reorder buffer. Only the IP
+    /// is compared, because a sender's source port is its own bound port
+    /// (ephemeral for librist's `ristsender`). Leave `None` on a receiver to
+    /// accept the first source that arrives.
     pub remote_addr: Option<SocketAddr>,
 
     /// Receiver buffer size (how long to wait for retransmissions).

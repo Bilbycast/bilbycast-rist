@@ -78,7 +78,7 @@ ristsender -i "udp://0.0.0.0:5000" -o "rist://127.0.0.1:6000?buffer=1000" -p 0
 ```bash
 cargo build            # debug
 cargo build --release  # optimised
-cargo test             # 63 unit tests
+cargo test             # unit + integration suites (both crates)
 ```
 
 No C compiler, CMake, or system libraries required.
@@ -101,6 +101,7 @@ Tested against librist 0.2.11 (Simple Profile, `-p 0`):
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `local_addr` | `0.0.0.0:5000` | Local RTP bind address (must be even port) |
+| `remote_addr` | `None` | Sender: the receiver's RTP address (required). Receiver: an **enforced source-IP pin** — RTP and RTCP from any other IP are dropped before the reorder buffer. Only the IP is compared. Leave `None` on a receiver to accept the first source that arrives |
 | `buffer_size` | 1000 ms | Receiver buffer for retransmission recovery |
 | `max_nack_retries` | 10 | Max NACK attempts per lost packet before giving up |
 | `rtcp_interval` | 100 ms | RTCP compound packet emission interval (TR-06-1 limit) |
