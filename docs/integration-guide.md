@@ -93,7 +93,10 @@ async fn run_receiver() -> anyhow::Result<()> {
 - Sends NACKs after RTT/2 (or a 20 ms floor when RTT is unknown or smaller)
 - Retries up to `max_nack_retries` times per lost packet
 - RTCP (RR + SDES + NACKs) emitted every 100 ms
-- The internal delivery channel has capacity 1024; slow consumers cause packet drops (logged as warnings)
+- The internal delivery channel has capacity 1024; slow consumers cause packet
+  drops that are silently counted on `RistConnStats::reorder_drops` — nothing is
+  logged. That counter is also bumped for stale (too-late) arrivals, so a rise in
+  it means backpressure *or* late packets, not one or the other
 
 ## Shutdown
 
@@ -101,8 +104,21 @@ async fn run_receiver() -> anyhow::Result<()> {
 // Graceful shutdown -- cancels all internal tasks
 sender.close();
 // or
-receiver.close();  // also available via drop
+receiver.close();
 ```
+
+`close()` is not optional on a receiver. There is no `impl Drop` on
+`RistSocket`, so dropping one only detaches: the receiver task's `JoinHandle`
+sits in `_tasks` and a dropped tokio handle detaches rather than aborts, the
+RTP/RTCP port pair stays bound, and the delivery thread — which exits only on
+the cancellation token — keeps draining into a closed channel and bumping
+`reorder_drops` forever.
+
+A sender happens to stop on drop, because `RistSocket` holds the only clone of
+the application channel's `Sender` and the sender loop breaks when that channel
+closes. Do not rely on it: it is incidental, it releases nothing until the task
+is next polled, and it has no receiver-side equivalent. Call `close()` on both
+roles.
 
 ## Configuration reference
 

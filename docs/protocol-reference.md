@@ -200,11 +200,13 @@ Sockets are created with:
 - 32 MB send buffer -- prevents send blocking during retransmit bursts
 - Non-blocking mode -- for tokio async I/O
 
-## Lock-Free Design
+## Concurrency Design
 
-The sender and receiver tasks own all mutable state. No `Mutex` or `RwLock` on the data path:
-- Sender task: sequence counter, RTCP state, retransmit buffer, RTT estimator
-- Receiver task: RTCP state, NACK scheduler, RTT estimator
+The sender and receiver tasks own all mutable state, with exactly one exception on the receiver side:
+- Sender task: sequence counter, RTCP state, retransmit buffer, RTT estimator -- no `Mutex` or `RwLock` anywhere
+- Receiver task: RTCP state, NACK scheduler, RTT estimator, plus the reorder/jitter buffer behind the single lock described below
 - Communication: `mpsc` channels for application data in/out
+
+That single lock is a `Mutex<ReorderBuffer>` shared between the RTP receive path and the delivery side. It is taken once per arrival *burst* -- one guard covering a single `insert` for every packet drained from the socket in that wake-up -- or once per drain for a `drain_ready` pop, and it is always released before the delivery `try_send`, so neither side can stall the other. The drain side is not a tokio task at all: it is a dedicated OS thread (`rist-drain`) parked on a `Condvar`, woken either by the receive path's `notify_one` or by the head slot's release deadline.
 
 The `tokio::select!` loop handles all I/O multiplexing without blocking.

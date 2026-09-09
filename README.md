@@ -12,7 +12,7 @@ Key properties:
 - **NACK-based ARQ** -- receiver detects gaps and requests retransmission
 - **RTT-aware timing** -- NACK scheduling adapts to measured round-trip time
 - **Dual-port RTP/RTCP** -- standard even/odd port pair (RFC 3550)
-- **SMPTE 2022-7 bonding** -- hitless failover across redundant network paths
+- **SMPTE 2022-7 bonding** -- hitless failover across redundant network paths (a property of the protocol; see Implementation status for what this crate exposes)
 - **Low, bounded latency** -- configurable receiver buffer (typically 100-2000 ms)
 
 ## Crate structure
@@ -125,7 +125,7 @@ Tested against librist 0.2.11 (Simple Profile, `-p 0`):
 | NACK-based retransmission (bitmask + range) | Done |
 | RTT estimation (EWMA) | Done |
 | NTP-aligned RTP timestamps | Done |
-| SMPTE 2022-7 bonding | Done |
+| SMPTE 2022-7 bonding | Done (protocol layer only) |
 | Async sender/receiver (tokio) | Done |
 | Dual-port UDP channel (SO_REUSEADDR, 32 MB buffers) | Done |
 | librist 0.2.11 interop (Simple Profile) | Done |
@@ -133,6 +133,8 @@ Tested against librist 0.2.11 (Simple Profile, `-p 0`):
 | PSK encryption (AES-CTR) | Stubbed |
 | DTLS 1.2 encryption | Stubbed |
 | Null packet deletion | Stubbed |
+
+"Protocol layer only" for bonding means exactly that: `rist_protocol::protocol::bonding::BondingMerger` is implemented and unit-tested, but no `RistSocket` API exposes multi-path bonding. `RistSocket::sender` and `RistSocket::receiver` are the only ways to build one (`RistListener::accept` just forwards to the latter), and `BondingConfig::additional_paths` has no consumer anywhere in the workspace. Callers build 2022-7 themselves -- bilbycast-edge opens two independent `RistSocket::receiver`s and merges the legs on its own.
 
 ## Architecture
 

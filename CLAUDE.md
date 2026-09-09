@@ -34,6 +34,12 @@ A standalone Rust library implementing the VSF RIST protocol for reliable media 
 - `receiver.rs` — Receiver task: RTP in, gap detection, NACK generation, periodic RTCP RR+SDES
 - `guard.rs` — Admission rules for an unauthenticated peer: source hold-down (a live slot does not move to a different source IP), NACK media-SSRC check, and the per-received-datagram NACK work budget
 - `socket.rs` — Public API: `RistSocket::sender()` and `RistSocket::receiver()`
+- `listener.rs` — `RistListener::accept()`: a one-line wrapper over `RistSocket::receiver(config)`. It binds the RTP+RTCP pair and returns immediately — the "waits for the first RTP packet" in the module comment is not what the code does — and nothing in the workspace constructs a `RistListener`
+- `config.rs` — `RistSocketConfig`, the single knob struct both roles take
+- `stats.rs` — `RistConnStats`, a block of `AtomicU64` counters shared as `Arc<RistConnStats>` with no lock anywhere, + `RistConnStatsSnapshot`
+- `stats_poller.rs` — `StatsCollector`: holds one `rist_protocol::stats::RistStats` and clones it on `snapshot()`. Nothing periodic despite the module name, and no callers — the live counters are `stats.rs`
+- `bonding_task.rs` — SMPTE 2022-7 bonding types only; declared in `lib.rs` and referenced nowhere else, so nothing wires it up yet
+- `tunnel_task.rs`, `dtls_channel.rs` — Main Profile placeholders (GRE-over-UDP, DTLS 1.2), stubbed for Phase 2/3
 
 ### Data Flow
 
@@ -52,15 +58,17 @@ Receiver UDP → receiver task parses RTP, detects gaps
 
 ```bash
 cargo build          # Build both crates
-cargo test           # Run all tests (63 unit tests in rist-protocol)
+cargo test           # Run all tests (67 unit tests in rist-protocol, 10 in rist-transport)
 cargo build --release
 ```
+
+`rist-protocol` declares two default-off features, `encryption` and `main-profile`. Both are dependency-only placeholders for the stubbed Phase 2/3 work — neither crate contains a single `cfg(feature = …)`, so enabling either pulls in unused optional deps (`aes`/`ctr`, `serde`/`serde_json`) and changes no behaviour.
 
 ## Key Design Decisions
 
 1. **No traits for transport abstraction** — follows bilbycast-srt pattern: concrete types + enum dispatch
 2. **Protocol/transport separation** — rist-protocol has zero async/I/O deps, fully testable
-3. **Lock-free data path** — sender/receiver tasks own all mutable state, communicate via channels
+3. **Channel-based data path, with one deliberate exception** — sender/receiver tasks own their mutable state and communicate via channels. The one shared object is `DrainShared { reorder: Mutex<ReorderBuffer>, signal: Condvar }` in `rist-transport/src/receiver.rs`: the recv task takes the lock once per readiness burst (a whole batch of datagrams inserted in one critical section) and the delivery thread takes it once per wake, draining into a scratch vec and doing its `try_send` **outside** the lock so an insert never blocks on the channel. Same shape as libsrt's recv-thread / TSBPD-thread mutex.
 4. **RIST carries native RTP** — unlike SRT, packets are standard RTP, simplifying bilbycast-edge integration
 
 ## Implementation Status
@@ -104,5 +112,6 @@ Remaining gaps are **Main Profile + DTLS + AES-CTR + null-packet deletion**, all
 
 ```
 bilbycast-edge
-  └── compiles against: bilbycast-rist (path dependency, future)
+  └── compiles against: bilbycast-rist — unconditional path dependencies on
+      rist-transport + rist-protocol (no Cargo feature, not `optional`)
 ```
