@@ -44,7 +44,7 @@ impl RistChannel {
     /// Bind a RIST channel on the given RTP address.
     /// The port must be even; RTCP will bind on port + 1.
     pub async fn bind(rtp_addr: SocketAddr) -> Result<Self, ChannelError> {
-        if rtp_addr.port() % 2 != 0 {
+        if !rtp_addr.port().is_multiple_of(2) {
             return Err(ChannelError::OddPort(rtp_addr.port()));
         }
 

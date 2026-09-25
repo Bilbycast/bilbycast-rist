@@ -136,7 +136,7 @@ impl RistApp {
                 actual: buf.len(),
             });
         }
-        let mut r = &buf[..];
+        let mut r = buf;
         let ssrc = r.get_u32();
         let mut name = [0u8; 4];
         r.copy_to_slice(&mut name);

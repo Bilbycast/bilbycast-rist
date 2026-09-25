@@ -87,7 +87,7 @@ impl NackPacket {
                 actual: buf.len(),
             });
         }
-        let mut r = &buf[..];
+        let mut r = buf;
         let sender_ssrc = r.get_u32();
         let media_ssrc = r.get_u32();
 
@@ -185,7 +185,7 @@ impl NackListBuilder {
             i += 1;
             while i < lost_seqs.len() {
                 let diff = lost_seqs[i].wrapping_sub(pid);
-                if diff >= 1 && diff <= 16 {
+                if (1..=16).contains(&diff) {
                     blp |= 1 << (diff - 1);
                     i += 1;
                 } else {

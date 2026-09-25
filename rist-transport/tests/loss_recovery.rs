@@ -105,15 +105,19 @@ async fn nack_recovers_lossy_media_in_order() {
     }
 
     // Receiver bound at RX; generous hold so retransmits land in time.
-    let mut rcfg = RistSocketConfig::default();
-    rcfg.local_addr = receiver_rtp;
-    rcfg.buffer_size = Duration::from_millis(800);
+    let rcfg = RistSocketConfig {
+        local_addr: receiver_rtp,
+        buffer_size: Duration::from_millis(800),
+        ..RistSocketConfig::default()
+    };
     let mut receiver = RistSocket::receiver(rcfg).await.unwrap();
     let rstats = receiver.stats();
 
     // Sender targets the relay's RTP port.
-    let mut scfg = RistSocketConfig::default();
-    scfg.local_addr = sender_local;
+    let scfg = RistSocketConfig {
+        local_addr: sender_local,
+        ..RistSocketConfig::default()
+    };
     let sender = RistSocket::sender(scfg, relay_rtp).await.unwrap();
 
     // Collector task: drain delivered payloads, record the embedded counter.

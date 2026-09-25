@@ -32,6 +32,8 @@ impl SeqNo {
     }
 
     /// Add an offset (wraps around).
+    // Public API name kept: renaming breaks callers, and a `u16` offset is not `Add<Self>`.
+    #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn add(self, n: u16) -> SeqNo {
         SeqNo(self.0.wrapping_add(n))

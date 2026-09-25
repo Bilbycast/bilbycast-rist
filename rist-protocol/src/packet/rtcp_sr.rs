@@ -40,7 +40,7 @@ impl SenderReport {
                 actual: buf.len(),
             });
         }
-        let mut r = &buf[..];
+        let mut r = buf;
         let ssrc = r.get_u32();
         let ntp_msw = r.get_u32();
         let ntp_lsw = r.get_u32();

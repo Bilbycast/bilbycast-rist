@@ -41,7 +41,7 @@ impl RtcpCommonHeader {
                 actual: buf.len(),
             });
         }
-        let mut r = &buf[..];
+        let mut r = buf;
         let first = r.get_u8();
         let version = (first >> 6) & 0x03;
         if version != 2 {

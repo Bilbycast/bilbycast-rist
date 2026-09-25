@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     while let Some(data) = rist.recv().await {
         let _ = udp_tx.send(&data).await;
         packets += 1;
-        if packets % 5000 == 0 {
+        if packets.is_multiple_of(5000) {
             println!("Received {packets} packets from RIST ({} bytes last)", data.len());
         }
     }

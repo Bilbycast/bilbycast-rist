@@ -79,11 +79,7 @@ impl RttEstimator {
             Some(srtt) => {
                 let rttvar = self.rttvar.unwrap_or(sample / 2);
                 // RTTVAR = (1 - 1/4) * RTTVAR + 1/4 * |SRTT - R|
-                let diff = if sample > srtt {
-                    sample - srtt
-                } else {
-                    srtt - sample
-                };
+                let diff = sample.abs_diff(srtt);
                 let new_rttvar = rttvar * 3 / 4 + diff / 4;
                 // SRTT = (1 - 1/8) * SRTT + 1/8 * R
                 let new_srtt = srtt * 7 / 8 + sample / 8;

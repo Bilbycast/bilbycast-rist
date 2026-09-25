@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     let mut count = 0u64;
     while let Some(data) = socket.recv().await {
         count += 1;
-        if count % 1000 == 0 {
+        if count.is_multiple_of(1000) {
             println!("Received {count} packets ({} bytes last)", data.len());
         }
     }

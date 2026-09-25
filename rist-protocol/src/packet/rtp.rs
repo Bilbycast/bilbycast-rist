@@ -66,7 +66,7 @@ impl RtpHeader {
             });
         }
 
-        let mut r = &buf[..];
+        let mut r = buf;
 
         let first = r.get_u8();
         let version = (first >> 6) & 0x03;
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn test_invalid_version() {
         let mut buf = [0u8; 12];
-        buf[0] = 0b11_0_0_0000; // version 3
+        buf[0] = 0b1100_0000; // V=3, P=0, X=0, CC=0
         assert!(matches!(
             RtpHeader::parse(&buf),
             Err(RistError::InvalidRtpVersion(3))

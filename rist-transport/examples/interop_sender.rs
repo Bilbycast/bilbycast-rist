@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
         let (len, _from) = udp_rx.recv_from(&mut buf).await?;
         rist.send(Bytes::copy_from_slice(&buf[..len])).await?;
         packets += 1;
-        if packets % 5000 == 0 {
+        if packets.is_multiple_of(5000) {
             println!("Forwarded {packets} packets to RIST");
         }
     }

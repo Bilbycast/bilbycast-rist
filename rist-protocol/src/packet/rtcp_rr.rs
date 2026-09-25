@@ -40,7 +40,7 @@ impl ReportBlock {
                 actual: buf.len(),
             });
         }
-        let mut r = &buf[..];
+        let mut r = buf;
         let ssrc = r.get_u32();
         let lost_word = r.get_u32();
         let fraction_lost = (lost_word >> 24) as u8;
@@ -98,7 +98,7 @@ impl ReceiverReport {
                 actual: buf.len(),
             });
         }
-        let mut r = &buf[..];
+        let mut r = buf;
         let ssrc = r.get_u32();
 
         let mut reports = Vec::with_capacity(rc as usize);
